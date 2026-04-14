@@ -76,8 +76,8 @@ Dependencies: `numpy`, `scipy`, `sympy`. No GPU needed.
 
 ## Current Status
 
-- Hybrid exact-form pre-pass for common 1D and 2D families before EML tree search
-- 1D vector input plus 2-feature matrix input with optional custom `feature_names`
+- Hybrid exact-form pre-pass for common 1D and multivariable families before EML tree search
+- 1D vector input plus matrix input with up to 3 features and optional custom `feature_names`
 - Deterministic search with `seed=` for repeatable comparisons
 - Native Hermes tool integration plus skill-only guidance
 - Dedicated multivariable benchmark script at `examples/benchmark_multivariable.py`
@@ -137,6 +137,21 @@ Result fields:
 - `eml_expression`: raw EML tree string, or `None` when the pre-pass found the answer
 - `mse`, `constants`, `leaf_types`: fit quality and low-level search details
 - `feature_names`, `used_features`: resolved input names and which features appear in the final formula
+- `analysis`: routing hints like likely family, recommended search mode, and feature importance
+- `verification`, `confidence`, `failure_modes`: trust checks for LLM/tool use
+- `candidates`: ranked alternative formulas with short rationales
+- `guidance`: compact LLM-facing summary with caveats and follow-up experiment suggestions
+
+For cheap routing before any search, call:
+
+```python
+from eml import analyze
+
+analysis = analyze(x, y)
+print(analysis["recommended_mode"])         # instant / balanced / deep
+print(analysis["likely_families"][0])       # cheap heuristic classifier
+print(analysis["should_attempt_regression"])
+```
 
 ### CLI
 
@@ -153,6 +168,9 @@ echo '{"x": [1,2,3,4], "y": [2.72,7.39,20.09,54.60]}' | eml-regress
 # From 2-feature JSON data
 echo '{"x": [[0.1,0.5],[0.2,0.5],[0.1,0.7],[0.2,0.7]], "y": [0.6,0.7,0.8,0.9]}' | eml-regress
 
+# From 3-feature JSON data
+echo '{"x": [[1,2,1],[2,2,1],[1,3,2],[2,3,2]], "y": [2,4,0.75,1.5], "feature_names": ["m1","m2","r"]}' | eml-regress
+
 # With custom feature names
 echo '{"x": [[0.1,0.5],[0.2,0.5],[0.1,0.7],[0.2,0.7]], "y": [0.6,0.7,0.8,0.9], "feature_names": ["a","b"]}' | eml-regress
 
@@ -160,7 +178,7 @@ echo '{"x": [[0.1,0.5],[0.2,0.5],[0.1,0.7],[0.2,0.7]], "y": [0.6,0.7,0.8,0.9], "
 echo '{"x": [...], "y": [...]}' | eml-regress --output-json
 ```
 
-JSON output includes `expression`, `eml_expression`, `depth`, `strategy`, `mse`, `constants`, `leaf_types`, `feature_names`, and `used_features`.
+JSON output includes the full structured result object, including `analysis`, `verification`, `confidence`, `failure_modes`, `candidates`, and `guidance`.
 
 ---
 
@@ -177,7 +195,7 @@ User: "What formula fits this data?"
           |
     Calls eml_symbolic_regression tool
           |
-    Gets back {"expression": "exp(x)", "quality": "exact", "strategy": "prepass"}
+    Gets back {"expression": "exp(x)", "quality": "exact", "strategy": "prepass", "confidence": {"label": "high"}}
           |
     Reports: "The data follows y = e^x"
 ```
@@ -200,6 +218,12 @@ Native Hermes responses include:
 
 - `expression`: best symbolic form to show the user
 - `quality`: `exact`, `approximate`, or `rough`
+- `analysis`: routing hints so a small model can decide whether the call was worthwhile
+- `confidence`: compact trust score plus reasons
+- `verification`: post-search checks and failure signals
+- `failure_modes`: warnings like piecewise / periodic / unstable constants / outlier dominance
+- `candidates`: ranked alternative formulas for model-side comparison
+- `guidance`: why the winner won, when not to trust it, and what follow-up data to collect
 - `strategy`: `prepass` or `eml_tree`
 - `depth`: EML depth only; `0` means the hybrid pre-pass solved it
 - `mse`, `constants`, `eml_expression`, `feature_names`, `used_features`
@@ -268,12 +292,12 @@ Two-variable benchmark on a small `(x0, x1)` grid:
 
 ### Sweet spot
 
-Common exponentials, logarithms, power laws, low-degree polynomials, and several basic 2D forms are found exactly and usually return before the EML tree search even starts. This covers exponential growth/decay, reciprocal relationships, roots, affine 2D forms, simple products and ratios, and standard algebraic forms.
+Common exponentials, logarithms, power laws, low-degree polynomials, and several basic multivariable forms are found exactly and usually return before the EML tree search even starts. This covers exponential growth/decay, reciprocal relationships, roots, affine multivariable forms, simple products and ratios, and standard algebraic forms.
 
 ### Honest limitations
 
 - Oscillatory / trig functions (`sin`, `cos`) still need deeper trees (depth 4+) for exact recovery
-- Up to 2 variables in the current tree search -- deeper multivariable scaling still needs guided search
+- Up to 3 variables in the current tree search -- deeper multivariable scaling still needs guided search
 - Clean data preferred -- the optimiser can overfit noise
 - Sparse or narrow-range data can be misleading -- a low-error polynomial surrogate may beat the intended closed form on small samples
 - Hermes `quality` is heuristic -- it is based on MSE thresholds, not a proof that the recovered expression is the unique underlying law
@@ -310,8 +334,8 @@ Every expression is a full binary tree where:
 Phase 0  Hybrid exact-form pre-pass
          Try cheap closed-form fits before touching the EML tree search.
          1D: polynomial (deg 1-4), power law, exponential, logarithmic.
-         2D: affine, bilinear, quadratic, power-law, exponential, and log-linear fits.
-         Solves x + 1, x^2, sqrt(x), 1/x, exp(x), ln(x), x0 + x1, x0*x1 in milliseconds.
+         2D/3D: affine, interaction, quadratic, power-law, exponential, and log-linear fits.
+         Solves x + 1, x^2, sqrt(x), 1/x, exp(x), ln(x), x0 + x1, x0*x1, and m1*m2/r^2 in milliseconds.
 ```
 
 ```
@@ -363,7 +387,7 @@ eml-symbolic-regression/
     quickstart.py               3-line usage
     from_data_points.py         Noisy measurement example
     benchmark.py                Single-variable benchmark generator
-    benchmark_multivariable.py  Two-feature benchmark generator
+    benchmark_multivariable.py  Multivariable benchmark generator
     cli_examples.sh             CLI usage patterns
   tests/
     test_engine.py              Regression + symbolic/numeric consistency checks

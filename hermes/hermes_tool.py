@@ -39,7 +39,8 @@ EML_SCHEMA = {
         "Discover the mathematical formula underlying numerical data. "
         "Given x and y arrays, finds the simplest closed-form expression y=f(x). "
         "Uses the EML operator eml(a,b)=exp(a)-ln(b) which can represent ALL "
-        "elementary functions. Returns the formula in standard math notation. "
+        "elementary functions. Returns structured diagnostics, candidate formulas, "
+        "confidence, and failure reporting in addition to the best formula. "
         "Use when: finding a formula from data points, identifying a function "
         "behind a pattern, verifying a mathematical relationship, or converting "
         "numerical data to symbolic form."
@@ -51,7 +52,7 @@ EML_SCHEMA = {
                 "description": (
                     "Input values. Use a 1D array for single-variable regression "
                     "or a 2D matrix shaped [n_samples][n_features] for multivariable "
-                    "regression (currently up to 2 features)."
+                    "regression (currently up to 3 features)."
                 ),
                 "oneOf": [
                     {
@@ -89,6 +90,15 @@ EML_SCHEMA = {
                     "4: complex compositions (slower)."
                 ),
             },
+            "analysis_only": {
+                "type": "boolean",
+                "default": False,
+                "description": (
+                    "If true, only run the cheap routing/classification layer and "
+                    "skip symbolic search. Use this when deciding whether the full "
+                    "regression call is worth the tokens and latency."
+                ),
+            },
         },
         "required": ["x", "y"],
     },
@@ -110,7 +120,7 @@ def _handle_eml_regression(args: dict, **kwargs) -> str:
         tool_result = lambda **kw: json.dumps(kw)
 
     try:
-        from eml import regress
+        from eml import analyze, regress
     except ImportError:
         return tool_error(
             "eml-symbolic-regression not installed. "
@@ -121,6 +131,7 @@ def _handle_eml_regression(args: dict, **kwargs) -> str:
     y = args.get("y")
     feature_names = args.get("feature_names")
     max_depth = args.get("max_depth", 3)
+    analysis_only = bool(args.get("analysis_only", False))
 
     if not x or not y:
         return tool_error("Both 'x' and 'y' arrays are required.")
@@ -133,6 +144,9 @@ def _handle_eml_regression(args: dict, **kwargs) -> str:
         sample_count = len(x_array)
         if sample_count != len(y_array):
             return tool_error(f"x ({sample_count}) and y ({len(y_array)}) must be same length.")
+        analysis = analyze(x_array, y_array, feature_names=feature_names)
+        if analysis_only:
+            return json.dumps({"analysis": analysis})
         result = regress(
             x_array,
             y_array,
@@ -143,19 +157,22 @@ def _handle_eml_regression(args: dict, **kwargs) -> str:
     except Exception as e:
         return tool_error(f"Regression failed: {str(e)}")
 
-    mse = result["mse"]
-    quality = "exact" if mse < 1e-8 else "approximate" if mse < 1e-1 else "rough"
-
     return json.dumps({
         "expression": result["expression"],
         "eml_expression": result["eml_expression"],
         "depth": result["depth"],
         "strategy": result.get("strategy"),
-        "mse": mse,
-        "quality": quality,
+        "mse": result["mse"],
+        "quality": result.get("quality"),
         "constants": result["constants"],
         "feature_names": result.get("feature_names", []),
         "used_features": result.get("used_features", []),
+        "analysis": result.get("analysis", analysis),
+        "verification": result.get("verification", {}),
+        "confidence": result.get("confidence", {}),
+        "failure_modes": result.get("failure_modes", []),
+        "candidates": result.get("candidates", []),
+        "guidance": result.get("guidance", {}),
     })
 
 

@@ -18,10 +18,15 @@ Basic usage:
 Full docs: https://github.com/Aezaror/eml-symbolic-regression
 """
 
-from .engine import symbolic_regression, evaluate_tree, eml_np
+from .engine import analyze_dataset, symbolic_regression, evaluate_tree, eml_np
 
 __version__ = "0.1.0"
-__all__ = ["regress", "symbolic_regression", "evaluate_tree", "eml_np"]
+__all__ = ["analyze", "regress", "symbolic_regression", "evaluate_tree", "eml_np"]
+
+
+def analyze(x, y, feature_names=None):
+    """Classify whether symbolic regression is worth attempting on a dataset."""
+    return analyze_dataset(x, y, feature_names=feature_names)
 
 
 def regress(x, y, max_depth=3, tolerance=1e-8, verbose=False, workers=None,
@@ -49,6 +54,11 @@ def regress(x, y, max_depth=3, tolerance=1e-8, verbose=False, workers=None,
             leaf_types     - Leaf configuration of best tree
             feature_names  - Resolved feature names used by the engine
             used_features  - Which input features appear in the final formula
+            analysis       - Routing diagnostics before the search
+            verification   - Post-search fit checks and failure reporting
+            confidence     - Compact trust score for LLM agents
+            candidates     - Ranked alternative formulas
+            guidance       - LLM-oriented explanation scaffolding
     """
     return symbolic_regression(
         x, y,

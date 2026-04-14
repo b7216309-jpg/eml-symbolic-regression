@@ -1,11 +1,11 @@
 {
   "name": "eml_symbolic_regression",
-  "description": "Discover the mathematical formula underlying numerical data. Given x and y arrays, finds the simplest closed-form expression y=f(x). Uses the EML operator eml(a,b)=exp(a)-ln(b) which can represent ALL elementary functions. Returns the formula in standard math notation. Use when: finding a formula from data points, identifying a function behind a pattern, verifying a mathematical relationship, or converting numerical data to symbolic form.",
+  "description": "Discover the mathematical formula underlying numerical data. Given x and y arrays, finds the simplest closed-form expression y=f(x). Uses the EML operator eml(a,b)=exp(a)-ln(b) which can represent ALL elementary functions. Returns structured diagnostics, candidate formulas, confidence, and failure reporting in addition to the best formula. Use when: finding a formula from data points, identifying a function behind a pattern, verifying a mathematical relationship, or converting numerical data to symbolic form.",
   "parameters": {
     "type": "object",
     "properties": {
       "x": {
-        "description": "Input values. Use a 1D array for single-variable regression or a 2D matrix shaped [n_samples][n_features] for multivariable regression (currently up to 2 features).",
+        "description": "Input values. Use a 1D array for single-variable regression or a 2D matrix shaped [n_samples][n_features] for multivariable regression (currently up to 3 features).",
         "oneOf": [
           {
             "type": "array",
@@ -34,6 +34,11 @@
         "type": "integer",
         "default": 3,
         "description": "Max tree depth 1-4. 1-2: basic ops (exp, ln, powers). 3: most elementary functions. 4: complex compositions (slower)."
+      },
+      "analysis_only": {
+        "type": "boolean",
+        "default": false,
+        "description": "If true, only run the cheap routing/classification layer and skip symbolic search. Use this when deciding whether the full regression call is worth the tokens and latency."
       }
     },
     "required": ["x", "y"]

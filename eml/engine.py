@@ -37,7 +37,7 @@ ZERO = "0"   # constant 0
 C = "c"      # trainable constant (fitted to data)
 
 LEAF_OPTIONS = [X, ONE, ZERO, C]
-MAX_SEARCH_FEATURES = 2
+MAX_SEARCH_FEATURES = 3
 EXHAUSTIVE_LIMIT = 20000
 MIN_VALID_FRACTION = 0.9
 SAMPLE_BUCKET_WEIGHTS = {
@@ -156,9 +156,93 @@ def _score_prediction(pred, y_data, min_valid_fraction=MIN_VALID_FRACTION):
     return raw_mse * (len(y_data) / valid)
 
 
+def _coerce_regression_inputs(x_data, y_data, feature_names=None):
+    """Validate and normalise regression inputs once for all entry points."""
+    x_data, feature_names = _coerce_feature_matrix(
+        x_data,
+        feature_names=feature_names,
+        preserve_scalar_name=True,
+    )
+    y_data = np.asarray(y_data, dtype=np.float64)
+    if y_data.ndim != 1:
+        raise ValueError("y_data must be a 1D array")
+    if len(y_data) == 0:
+        raise ValueError("y_data must be non-empty")
+    if len(x_data) != len(y_data):
+        raise ValueError("x_data and y_data must have the same length")
+    if not np.all(np.isfinite(y_data)):
+        raise ValueError("y_data must contain only finite values")
+    return x_data, y_data, feature_names
+
+
+def _safe_scale(y_data):
+    """Choose a stable normalisation scale for residual metrics."""
+    scale = float(np.std(y_data))
+    if scale > 1e-12:
+        return scale
+    scale = float(np.mean(np.abs(y_data)))
+    return scale if scale > 1e-12 else 1.0
+
+
+def _normalized_rmse(mse, y_data):
+    """Dimensionless error ratio for heuristic comparisons."""
+    if not np.isfinite(mse):
+        return float("inf")
+    return float(np.sqrt(max(float(mse), 0.0)) / _safe_scale(y_data))
+
+
+def _safe_corr(a, b):
+    """Absolute Pearson correlation, or 0 when degenerate."""
+    a = np.asarray(a, dtype=np.float64)
+    b = np.asarray(b, dtype=np.float64)
+    if len(a) < 2:
+        return 0.0
+    if np.std(a) < 1e-12 or np.std(b) < 1e-12:
+        return 0.0
+    corr = np.corrcoef(a, b)[0, 1]
+    return float(abs(corr)) if np.isfinite(corr) else 0.0
+
+
+def _quality_from_metrics(mse, y_data, tolerance):
+    """Map fit quality to a small stable label set."""
+    nrmse = _normalized_rmse(mse, y_data)
+    if mse < tolerance:
+        return "exact"
+    if nrmse < 0.10 or mse < max(1e-2, tolerance * 1e5):
+        return "approximate"
+    return "rough"
+
+
+def _result_complexity(expression, leaf_types=None):
+    """Estimate expression complexity for ranking and confidence."""
+    if leaf_types:
+        return int(len(leaf_types))
+    if expression is None:
+        return 0
+    try:
+        return int(sp.count_ops(sp.sympify(expression)))
+    except Exception:
+        return max(1, len(str(expression)) // 6)
+
+
+def _empty_candidate_board():
+    """Container for deduplicated candidate formulas."""
+    return {}
+
+
+def _candidate_signature(candidate):
+    """Stable signature used to deduplicate candidate formulas."""
+    return (
+        candidate.get("strategy"),
+        candidate.get("expression"),
+        candidate.get("eml_expression"),
+    )
+
+
 def _build_result(expression, mse, depth, leaf_types=None, constants=None,
                   eml_expression=None, strategy=None, feature_names=None,
-                  used_features=None):
+                  used_features=None, family=None, rationale=None,
+                  quality=None, complexity=None):
     """Normalise result payloads across search and pre-pass paths."""
     return {
         "expression": str(expression) if expression is not None else None,
@@ -170,7 +254,625 @@ def _build_result(expression, mse, depth, leaf_types=None, constants=None,
         "strategy": strategy,
         "feature_names": list(feature_names or []),
         "used_features": list(used_features or []),
+        "family": family,
+        "rationale": rationale,
+        "quality": quality,
+        "complexity": int(complexity) if complexity is not None else _result_complexity(expression, leaf_types),
+        "analysis": {},
+        "verification": {},
+        "confidence": {},
+        "failure_modes": [],
+        "candidates": [],
+        "guidance": {},
     }
+
+
+def _register_candidate(board, candidate, max_entries=12):
+    """Keep a small ranked set of best distinct candidate formulas."""
+    if candidate.get("expression") is None and candidate.get("eml_expression") is None:
+        return
+    candidate = dict(candidate)
+    candidate.pop("analysis", None)
+    candidate.pop("verification", None)
+    candidate.pop("confidence", None)
+    candidate.pop("failure_modes", None)
+    candidate.pop("candidates", None)
+    candidate.pop("guidance", None)
+    key = _candidate_signature(candidate)
+    prev = board.get(key)
+    rank_key = (
+        candidate.get("mse", float("inf")),
+        candidate.get("complexity", 999999),
+        candidate.get("depth") if candidate.get("depth") is not None else 999999,
+    )
+    if prev is None:
+        board[key] = candidate
+    else:
+        prev_rank = (
+            prev.get("mse", float("inf")),
+            prev.get("complexity", 999999),
+            prev.get("depth") if prev.get("depth") is not None else 999999,
+        )
+        if rank_key < prev_rank:
+            board[key] = candidate
+    if len(board) > max_entries:
+        ranked = sorted(
+            board.items(),
+            key=lambda item: (
+                item[1].get("mse", float("inf")),
+                item[1].get("complexity", 999999),
+                item[1].get("depth") if item[1].get("depth") is not None else 999999,
+            ),
+        )
+        for stale_key, _ in ranked[max_entries:]:
+            board.pop(stale_key, None)
+
+
+def _ranked_candidates(board, limit=5):
+    """Return the best candidate list in deterministic order."""
+    ranked = sorted(
+        board.values(),
+        key=lambda item: (
+            item.get("mse", float("inf")),
+            item.get("complexity", 999999),
+            item.get("depth") if item.get("depth") is not None else 999999,
+        ),
+    )
+    result = []
+    for rank, candidate in enumerate(ranked[:limit], start=1):
+        entry = dict(candidate)
+        entry["rank"] = rank
+        result.append(entry)
+    return result
+
+
+def _record_family_score(scores, family, pred, y_data, rationale, features=None):
+    """Store one cheap family-fit probe for routing heuristics."""
+    mse = _score_prediction(pred, y_data, min_valid_fraction=1.0)
+    if not np.isfinite(mse):
+        return
+    scores.append({
+        "family": family,
+        "mse": float(mse),
+        "normalized_rmse": _normalized_rmse(mse, y_data),
+        "rationale": rationale,
+        "features": list(features or []),
+    })
+
+
+def _periodicity_score(y_data):
+    """Detect repeated oscillation without claiming a true symbolic period."""
+    if len(y_data) < 12:
+        return 0.0
+    centred = y_data - np.mean(y_data)
+    scale = np.std(centred)
+    if scale < 1e-12:
+        return 0.0
+    acf = np.correlate(centred, centred, mode="full")[len(y_data) - 1:]
+    if not len(acf) or acf[0] <= 0:
+        return 0.0
+    acf = acf / acf[0]
+    max_lag = max(3, len(y_data) // 3)
+    peak = float(np.max(acf[2:max_lag])) if max_lag > 2 else 0.0
+    turns = np.count_nonzero(np.diff(np.sign(np.diff(y_data))) != 0)
+    return float(np.clip(max(peak, 0.0) * min(turns / 4.0, 1.0), 0.0, 1.0))
+
+
+def _piecewise_score(y_data):
+    """Crude edge/jump detector for piecewise-looking traces."""
+    if len(y_data) < 8:
+        return 0.0
+    grad = np.diff(y_data)
+    if not len(grad):
+        return 0.0
+    med = float(np.median(np.abs(grad))) + 1e-12
+    jump = float(np.max(np.abs(np.diff(grad)))) if len(grad) > 1 else 0.0
+    return float(np.clip(jump / (8.0 * med), 0.0, 1.0))
+
+
+def _feature_importance(x_data, y_data, feature_names):
+    """Simple importance proxy for LLM-facing explanations."""
+    raw = np.array([_safe_corr(x_data[:, idx], y_data) for idx in range(x_data.shape[1])], dtype=np.float64)
+    total = float(raw.sum())
+    if total <= 1e-12:
+        weights = np.full(len(feature_names), 1.0 / max(1, len(feature_names)), dtype=np.float64)
+    else:
+        weights = raw / total
+    return [
+        {"feature": name, "score": float(weight)}
+        for name, weight in zip(feature_names, weights)
+    ]
+
+
+def _pairwise_indices(n_features):
+    """Enumerate upper-triangular feature pairs once."""
+    return [
+        (i, j)
+        for i in range(n_features)
+        for j in range(i + 1, n_features)
+    ]
+
+
+def _multivariate_designs(x_data):
+    """Cheap multivariate design matrices for routing and pre-pass fits."""
+    ones = np.ones(len(x_data), dtype=np.float64)
+    base = [ones] + [x_data[:, idx] for idx in range(x_data.shape[1])]
+    pairwise = [x_data[:, i] * x_data[:, j] for i, j in _pairwise_indices(x_data.shape[1])]
+    squares = [x_data[:, idx] ** 2 for idx in range(x_data.shape[1])]
+    designs = {
+        "additive_multivariate": np.column_stack(base),
+        "pairwise_interaction_multivariate": np.column_stack(base + pairwise),
+        "quadratic_multivariate": np.column_stack(base + pairwise + squares),
+    }
+    if x_data.shape[1] >= 3:
+        triple = np.prod(x_data, axis=1)
+        designs["full_interaction_multivariate"] = np.column_stack(base + pairwise + [triple])
+    return designs
+
+
+def _multivariate_symbolic_basis(x_data, feature_names, feature_symbols):
+    """Symbolic companions to the cheap multivariate design matrices."""
+    ones = [(np.ones(len(x_data), dtype=np.float64), sp.Integer(1), [])]
+    linear = [
+        (x_data[:, idx], feature_symbols[name], [name])
+        for idx, name in enumerate(feature_names)
+    ]
+    pairwise = [
+        (
+            x_data[:, i] * x_data[:, j],
+            feature_symbols[feature_names[i]] * feature_symbols[feature_names[j]],
+            [feature_names[i], feature_names[j]],
+        )
+        for i, j in _pairwise_indices(len(feature_names))
+    ]
+    squares = [
+        (x_data[:, idx] ** 2, feature_symbols[name] ** 2, [name])
+        for idx, name in enumerate(feature_names)
+    ]
+    families = {
+        "additive_multivariate": ones + linear,
+        "pairwise_interaction_multivariate": ones + linear + pairwise,
+        "quadratic_multivariate": ones + linear + pairwise + squares,
+    }
+    if len(feature_names) >= 3:
+        families["full_interaction_multivariate"] = (
+            ones + linear + pairwise + [
+                (
+                    np.prod(x_data, axis=1),
+                    sp.prod(feature_symbols[name] for name in feature_names),
+                    list(feature_names),
+                )
+            ]
+        )
+    return families
+
+
+def _family_routing_analysis(x_data, y_data, feature_names):
+    """Cheap classifier used to decide whether symbolic regression is promising."""
+    scores = []
+    for idx, name in enumerate(feature_names):
+        x_col = x_data[:, idx]
+        _record_family_score(
+            scores,
+            "linear",
+            np.polyval(np.polyfit(x_col, y_data, 1), x_col),
+            y_data,
+            f"Low residual affine fit on feature {name}.",
+            features=[name],
+        )
+        degree = min(3, max(1, len(x_col) - 1))
+        _record_family_score(
+            scores,
+            f"polynomial_degree_{degree}",
+            np.polyval(np.polyfit(x_col, y_data, degree), x_col),
+            y_data,
+            f"Low-degree polynomial fit on feature {name} matches the data shape.",
+            features=[name],
+        )
+
+        if np.all(x_col > 0):
+            coeffs = np.polyfit(np.log(x_col), y_data, 1)
+            _record_family_score(
+                scores,
+                "logarithmic",
+                coeffs[0] * np.log(x_col) + coeffs[1],
+                y_data,
+                f"Linear fit in log({name}) space is competitive.",
+                features=[name],
+            )
+        if np.all(y_data > 0):
+            coeffs = np.polyfit(x_col, np.log(y_data), 1)
+            _record_family_score(
+                scores,
+                "exponential",
+                float(np.exp(coeffs[1])) * np.exp(coeffs[0] * x_col),
+                y_data,
+                f"Linear fit in log(y) vs {name} space is competitive.",
+                features=[name],
+            )
+        if np.all(x_col > 0) and np.all(y_data > 0):
+            coeffs = np.polyfit(np.log(x_col), np.log(y_data), 1)
+            _record_family_score(
+                scores,
+                "power_law",
+                float(np.exp(coeffs[1])) * np.power(x_col, coeffs[0]),
+                y_data,
+                f"Log-log fit on feature {name} is competitive.",
+                features=[name],
+            )
+
+    if x_data.shape[1] >= 2:
+        for family, design in _multivariate_designs(x_data).items():
+            coeffs, *_ = np.linalg.lstsq(design, y_data, rcond=None)
+            rationale = {
+                "additive_multivariate": "Additive multivariate model explains most variance.",
+                "pairwise_interaction_multivariate": "Pairwise interactions materially improve the fit.",
+                "quadratic_multivariate": "Low-order polynomial terms explain the multivariate structure.",
+                "full_interaction_multivariate": "A full three-way interaction is competitive on the observed samples.",
+            }.get(family, "A multivariate linearized family is competitive.")
+            _record_family_score(
+                scores,
+                family,
+                design @ coeffs,
+                y_data,
+                rationale,
+                features=feature_names,
+            )
+
+        if np.all(y_data > 0):
+            design = np.column_stack(
+                [np.ones(len(y_data), dtype=np.float64)] + [x_data[:, idx] for idx in range(x_data.shape[1])]
+            )
+            coeffs, *_ = np.linalg.lstsq(design, np.log(y_data), rcond=None)
+            linear_part = sum(coeff * x_data[:, idx] for idx, coeff in enumerate(coeffs[1:]))
+            _record_family_score(
+                scores,
+                "separable_exponential",
+                float(np.exp(coeffs[0])) * np.exp(linear_part),
+                y_data,
+                "Log-linear fit suggests separable exponential structure.",
+                features=feature_names,
+            )
+        if np.all(x_data > 0) and np.all(y_data > 0):
+            design = np.column_stack(
+                [np.ones(len(y_data), dtype=np.float64)] + [np.log(x_data[:, idx]) for idx in range(x_data.shape[1])]
+            )
+            coeffs, *_ = np.linalg.lstsq(design, np.log(y_data), rcond=None)
+            pred = float(np.exp(coeffs[0])) * np.prod(
+                [np.power(x_data[:, idx], coeffs[idx + 1]) for idx in range(x_data.shape[1])],
+                axis=0,
+            )
+            _record_family_score(
+                scores,
+                "separable_power_law",
+                pred,
+                y_data,
+                "Log-log fit suggests separable multiplicative structure.",
+                features=feature_names,
+            )
+
+    return sorted(scores, key=lambda item: (item["normalized_rmse"], item["mse"]))
+
+
+def analyze_dataset(x_data, y_data, feature_names=None):
+    """Classify whether symbolic regression is worth attempting on a dataset."""
+    x_data, y_data, feature_names = _coerce_regression_inputs(
+        x_data,
+        y_data,
+        feature_names=feature_names,
+    )
+    scores = _family_routing_analysis(x_data, y_data, feature_names)
+    best_family = scores[0] if scores else None
+    periodic_score = _periodicity_score(y_data)
+    piecewise_score = _piecewise_score(y_data)
+    feature_importance = _feature_importance(x_data, y_data, feature_names)
+
+    flags = []
+    if len(y_data) < max(8, 6 * x_data.shape[1]):
+        flags.append("too_few_points")
+    if x_data.shape[1] > MAX_SEARCH_FEATURES:
+        flags.append("too_many_features")
+    if periodic_score > 0.55:
+        flags.append("looks_periodic")
+    if piecewise_score > 0.65:
+        flags.append("appears_piecewise")
+    if best_family and best_family["normalized_rmse"] < 0.03:
+        if best_family["family"] == "exponential":
+            flags.append("looks_exponential")
+        elif best_family["family"] == "power_law":
+            flags.append("looks_power_law")
+        elif best_family["family"].startswith("separable_"):
+            flags.append("looks_separable_multivariate")
+    if best_family and best_family["normalized_rmse"] > 0.25 and periodic_score < 0.45:
+        flags.append("probably_not_symbolic")
+
+    should_attempt = (
+        x_data.shape[1] <= MAX_SEARCH_FEATURES
+        and len(y_data) >= max(6, 3 * x_data.shape[1])
+        and "probably_not_symbolic" not in flags
+    )
+
+    if "too_many_features" in flags:
+        recommended_mode = "instant"
+    elif "too_few_points" in flags:
+        recommended_mode = "instant"
+    elif "looks_periodic" in flags or "appears_piecewise" in flags:
+        recommended_mode = "balanced"
+    elif best_family and best_family["normalized_rmse"] < 0.03:
+        recommended_mode = "instant"
+    elif x_data.shape[1] >= 2:
+        recommended_mode = "balanced"
+    else:
+        recommended_mode = "deep"
+
+    units_assumptions = [
+        "No explicit unit inference is performed; input values are treated as dimensionless numbers.",
+        "Any log/power-law hints assume strictly positive values on the transformed axes.",
+    ]
+
+    return {
+        "sample_count": int(len(y_data)),
+        "n_features": int(x_data.shape[1]),
+        "feature_names": list(feature_names),
+        "supported": bool(x_data.shape[1] <= MAX_SEARCH_FEATURES),
+        "should_attempt_regression": bool(should_attempt),
+        "recommended_mode": recommended_mode,
+        "flags": flags,
+        "likely_families": scores[:3],
+        "periodicity_score": float(periodic_score),
+        "piecewise_score": float(piecewise_score),
+        "feature_importance": feature_importance,
+        "units_assumptions": units_assumptions,
+    }
+
+
+def _predict_candidate(candidate, x_data, feature_names):
+    """Evaluate any candidate formula back on the observed samples."""
+    if candidate.get("leaf_types"):
+        return evaluate_tree(
+            candidate["leaf_types"],
+            x_data,
+            candidate.get("constants", []),
+            feature_names=feature_names,
+        )
+
+    expression = candidate.get("expression")
+    if expression is None:
+        return np.full(len(x_data), np.nan, dtype=np.float64)
+
+    expr = sp.sympify(expression)
+    if not expr.free_symbols:
+        return np.full(len(x_data), float(expr), dtype=np.float64)
+    free_symbols = {sym.name: sym for sym in expr.free_symbols}
+    ordered_names = [name for name in feature_names if name in free_symbols]
+    fn = sp.lambdify([free_symbols[name] for name in ordered_names], expr, "numpy")
+    args = [x_data[:, feature_names.index(name)] for name in ordered_names]
+    pred = fn(*args)
+    if np.isscalar(pred):
+        return np.full(len(x_data), float(pred), dtype=np.float64)
+    return np.asarray(pred, dtype=np.float64)
+
+
+def _tree_candidate(leaf_types, mse, constants, depth, feature_names, feature_symbols,
+                    y_data, tolerance):
+    """Convert one EML tree into the common candidate/result shape."""
+    try:
+        sym = tree_to_sympy(leaf_types, constants or None, feature_symbols=feature_symbols)
+    except Exception:
+        sym = None
+    expression = sym if sym is not None else _eml_str(leaf_types, constants)
+    used_features = _used_features_from_leaf_types(leaf_types, feature_names)
+    return _build_result(
+        expression,
+        mse,
+        depth,
+        leaf_types=leaf_types,
+        constants=constants,
+        eml_expression=_eml_str(leaf_types, constants),
+        strategy="eml_tree",
+        feature_names=feature_names,
+        used_features=used_features,
+        family="eml_tree",
+        rationale=f"Best EML tree encountered at depth {depth}.",
+        quality=_quality_from_metrics(mse, y_data, tolerance),
+    )
+
+
+def _residual_summary(pred, y_data):
+    """Compact residual diagnostics for LLM-facing output."""
+    mask = np.isfinite(pred)
+    valid = int(mask.sum())
+    if valid == 0:
+        return {
+            "valid_fraction": 0.0,
+            "mae": float("inf"),
+            "max_abs_error": float("inf"),
+            "median_abs_error": float("inf"),
+        }
+    residuals = pred[mask] - y_data[mask]
+    abs_resid = np.abs(residuals)
+    return {
+        "valid_fraction": float(valid / len(y_data)),
+        "mae": float(np.mean(abs_resid)),
+        "max_abs_error": float(np.max(abs_resid)),
+        "median_abs_error": float(np.median(abs_resid)),
+    }
+
+
+def _constant_stability(best, x_data, y_data, feature_names):
+    """Probe whether fitted constants are brittle to small perturbations."""
+    if not best.get("leaf_types") or not best.get("constants"):
+        return None
+    constants = np.asarray(best["constants"], dtype=np.float64)
+    deltas = np.array([0.99, 1.01], dtype=np.float64)
+    ratios = []
+    base_mse = max(best["mse"], 1e-12)
+    for delta in deltas:
+        trial = constants * delta
+        pred = evaluate_tree(best["leaf_types"], x_data, trial, feature_names=feature_names)
+        mse = _score_prediction(pred, y_data)
+        ratios.append(float(mse / base_mse))
+    return {
+        "perturbation": 0.01,
+        "mse_ratio_min": float(min(ratios)),
+        "mse_ratio_max": float(max(ratios)),
+    }
+
+
+def _describe_regions(x_data, idxs, feature_names):
+    """Summarise disagreement hotspots as concrete data-collection hints."""
+    if len(idxs) == 0:
+        return []
+    descriptions = []
+    if x_data.shape[1] == 1:
+        for idx in idxs:
+            descriptions.append(f"{feature_names[0]}~={x_data[idx, 0]:.3g}")
+    else:
+        for idx in idxs:
+            parts = [f"{name}~={x_data[idx, col]:.3g}" for col, name in enumerate(feature_names)]
+            descriptions.append(", ".join(parts))
+    return descriptions
+
+
+def _recommended_followup(best, candidates, x_data, feature_names):
+    """Suggest the next measurement that would separate close alternatives."""
+    if len(candidates) < 2:
+        used = ", ".join(best.get("used_features") or feature_names)
+        return f"Collect a few more points spanning the edges of the {used} range."
+    best_pred = _predict_candidate(candidates[0], x_data, feature_names)
+    alt_pred = _predict_candidate(candidates[1], x_data, feature_names)
+    diff = np.abs(best_pred - alt_pred)
+    mask = np.isfinite(diff)
+    if not mask.any():
+        return "Collect additional points in regions not covered by the current sample."
+    ranked = np.argsort(diff[mask])[-3:]
+    source_idx = np.nonzero(mask)[0][ranked]
+    regions = _describe_regions(x_data, source_idx[::-1], feature_names)
+    if not regions:
+        return "Collect additional points in regions not covered by the current sample."
+    return (
+        "Collect extra data where the top two candidates disagree most: "
+        + "; ".join(regions)
+        + "."
+    )
+
+
+def _verification_summary(best, x_data, y_data, feature_names, candidates, analysis, tolerance):
+    """Post-search checks used to separate verified from shaky fits."""
+    pred = _predict_candidate(best, x_data, feature_names)
+    residuals = _residual_summary(pred, y_data)
+    holdout_mask = (np.arange(len(y_data)) % 5) == 0
+    holdout_pred = pred[holdout_mask]
+    holdout_y = y_data[holdout_mask]
+    holdout_mse = _score_prediction(holdout_pred, holdout_y, min_valid_fraction=1.0)
+    simpler_alt = None
+    for candidate in candidates[1:]:
+        if candidate["complexity"] <= best["complexity"]:
+            simpler_alt = candidate
+            break
+    simpler_gap = None
+    if simpler_alt is not None and np.isfinite(best["mse"]):
+        simpler_gap = float(simpler_alt["mse"] / max(best["mse"], 1e-12))
+
+    failure_modes = []
+    if "too_few_points" in analysis["flags"]:
+        failure_modes.append("insufficient_data")
+    if "appears_piecewise" in analysis["flags"]:
+        failure_modes.append("data_appears_piecewise")
+    if "looks_periodic" in analysis["flags"] and best["quality"] != "exact":
+        failure_modes.append("periodic_structure_detected_but_grammar_insufficient")
+    if residuals["max_abs_error"] > 10 * max(residuals["median_abs_error"], 1e-12):
+        failure_modes.append("fit_dominated_by_one_outlier")
+    stability = _constant_stability(best, x_data, y_data, feature_names)
+    if stability and stability["mse_ratio_max"] > 5.0:
+        failure_modes.append("constant_optimization_unstable")
+    if simpler_gap is not None and simpler_gap < 1.2:
+        failure_modes.append("multiple_competing_candidates")
+    if "probably_not_symbolic" in analysis["flags"] and best["quality"] == "rough":
+        failure_modes.append("probably_not_symbolic")
+
+    if best["quality"] == "exact" and not failure_modes:
+        status = "verified"
+    elif best["quality"] in {"exact", "approximate"}:
+        status = "plausible"
+    else:
+        status = "weak"
+
+    return {
+        "status": status,
+        "holdout_mse": float(holdout_mse),
+        "holdout_normalized_rmse": _normalized_rmse(holdout_mse, holdout_y),
+        "residual_summary": residuals,
+        "simpler_alternative_gap": simpler_gap,
+        "constant_stability": stability,
+        "failure_modes": failure_modes,
+    }
+
+
+def _confidence_summary(best, analysis, verification):
+    """Turn numeric diagnostics into a compact confidence object."""
+    reasons = []
+    score = 0.85 if best["quality"] == "exact" else 0.62 if best["quality"] == "approximate" else 0.32
+    if best.get("strategy") == "prepass":
+        score += 0.05
+        reasons.append("A simple closed-form family fit matched before tree search.")
+    if analysis.get("likely_families"):
+        top_family = analysis["likely_families"][0]
+        if top_family["normalized_rmse"] < 0.05:
+            score += 0.05
+            reasons.append(f"Cheap routing heuristics also favored {top_family['family']}.")
+    for failure in verification.get("failure_modes", []):
+        score -= 0.08
+    holdout_nrmse = verification.get("holdout_normalized_rmse", float("inf"))
+    if np.isfinite(holdout_nrmse) and holdout_nrmse < 0.10:
+        reasons.append("Post-fit split residuals remain small.")
+    elif np.isfinite(holdout_nrmse):
+        score -= 0.05
+        reasons.append("Post-fit split residuals are noticeably larger.")
+    score = float(np.clip(score, 0.02, 0.99))
+    label = "high" if score >= 0.80 else "medium" if score >= 0.55 else "low"
+    return {
+        "score": score,
+        "label": label,
+        "reasons": reasons,
+    }
+
+
+def _guidance_summary(best, analysis, verification, candidates, x_data, feature_names):
+    """LLM-oriented scaffold for small-model tool use."""
+    why_best = best.get("rationale") or f"Lowest observed error among {best.get('strategy') or 'search'} candidates."
+    if verification["failure_modes"]:
+        caveat = "Watch for: " + ", ".join(verification["failure_modes"]) + "."
+    else:
+        caveat = "No major failure signals were detected on the observed samples."
+    followup = _recommended_followup(best, candidates, x_data, feature_names)
+    conclusion = f"Best current formula: y = {best.get('expression') or 'unknown'}."
+    return {
+        "why_best": why_best,
+        "when_not_to_trust": caveat,
+        "follow_up_experiment": followup,
+        "user_conclusion": conclusion,
+    }
+
+
+def _finalize_result(best, x_data, y_data, feature_names, analysis, candidate_board, tolerance):
+    """Attach diagnostics, confidence, and candidates to the best fit."""
+    best = dict(best)
+    best["analysis"] = analysis
+    candidates = _ranked_candidates(candidate_board, limit=5)
+    if best.get("expression") is not None:
+        best_sig = _candidate_signature(best)
+        if all(_candidate_signature(candidate) != best_sig for candidate in candidates):
+            _register_candidate(candidate_board, best)
+            candidates = _ranked_candidates(candidate_board, limit=5)
+    best["candidates"] = candidates
+    best["quality"] = _quality_from_metrics(best["mse"], y_data, tolerance)
+    verification = _verification_summary(best, x_data, y_data, feature_names, candidates or [best], analysis, tolerance)
+    best["verification"] = verification
+    best["failure_modes"] = verification["failure_modes"]
+    best["confidence"] = _confidence_summary(best, analysis, verification)
+    best["guidance"] = _guidance_summary(best, analysis, verification, candidates or [best], x_data, feature_names)
+    return best
 
 
 def _fingerprint_array(values, sample_idx):
@@ -440,9 +1142,24 @@ def _nice(val, tol=1e-5):
     return sp.Float(val, 4)
 
 
-def _maybe_prepass_result(pred, expr, y_data, tolerance, feature_names, used_features):
+def _maybe_prepass_result(pred, expr, y_data, tolerance, feature_names, used_features,
+                          candidate_board=None, family=None, rationale=None):
     """Wrap an exact or near-exact pre-pass fit into the standard result shape."""
     mse = _score_prediction(pred, y_data, min_valid_fraction=1.0)
+    candidate = _build_result(
+        expr,
+        mse,
+        depth=0,
+        strategy="prepass",
+        feature_names=feature_names,
+        used_features=used_features,
+        family=family,
+        rationale=rationale,
+        quality=None,
+    )
+    if candidate_board is not None:
+        candidate["quality"] = _quality_from_metrics(mse, y_data, tolerance)
+        _register_candidate(candidate_board, candidate)
     if mse < tolerance:
         try:
             expr = sp.simplify(expr)
@@ -455,11 +1172,14 @@ def _maybe_prepass_result(pred, expr, y_data, tolerance, feature_names, used_fea
             strategy="prepass",
             feature_names=feature_names,
             used_features=used_features,
+            family=family,
+            rationale=rationale,
         )
     return None
 
 
-def _fit_linear_basis(basis_terms, y_data, tolerance, feature_names, nice_tol):
+def _fit_linear_basis(basis_terms, y_data, tolerance, feature_names, nice_tol,
+                      candidate_board=None, family=None, rationale=None):
     """Fit a linear combination of fixed basis functions with least squares."""
     if not basis_terms:
         return None
@@ -483,16 +1203,30 @@ def _fit_linear_basis(basis_terms, y_data, tolerance, feature_names, nice_tol):
         tolerance,
         feature_names,
         [name for name in feature_names if name in used],
+        candidate_board=candidate_board,
+        family=family,
+        rationale=rationale,
     )
 
 
-def _fit_standard_forms_1d(x_data, y_data, tolerance, x_sym, feature_name, feature_names):
+def _fit_standard_forms_1d(x_data, y_data, tolerance, x_sym, feature_name, feature_names,
+                           candidate_board=None):
     """Cheap exact-fit pre-pass for common one-variable function families."""
     nice_tol = max(tolerance, 1e-5)
 
-    def _maybe_result(pred, expr):
+    def _maybe_result(pred, expr, family, rationale):
         used = [feature_name] if x_sym in getattr(expr, "free_symbols", set()) else []
-        return _maybe_prepass_result(pred, expr, y_data, tolerance, feature_names, used)
+        return _maybe_prepass_result(
+            pred,
+            expr,
+            y_data,
+            tolerance,
+            feature_names,
+            used,
+            candidate_board=candidate_board,
+            family=family,
+            rationale=rationale,
+        )
 
     for degree in range(1, 5):
         if len(x_data) < degree + 1:
@@ -504,7 +1238,12 @@ def _fit_standard_forms_1d(x_data, y_data, tolerance, x_sym, feature_name, featu
             if abs(coeff) < nice_tol:
                 continue
             expr += _nice(float(coeff), tol=nice_tol) * x_sym ** power
-        result = _maybe_result(pred, sp.expand(expr))
+        result = _maybe_result(
+            pred,
+            sp.expand(expr),
+            family=f"polynomial_degree_{degree}",
+            rationale=f"Degree-{degree} polynomial fit matched the sampled data.",
+        )
         if result is not None:
             return result
 
@@ -513,7 +1252,12 @@ def _fit_standard_forms_1d(x_data, y_data, tolerance, x_sym, feature_name, featu
         scale = float(np.exp(intercept))
         pred = scale * np.power(x_data, slope)
         expr = _nice(scale, tol=nice_tol) * x_sym ** _nice(slope, tol=nice_tol)
-        result = _maybe_result(pred, expr)
+        result = _maybe_result(
+            pred,
+            expr,
+            family="power_law",
+            rationale="A log-log linearization strongly favors a power-law relationship.",
+        )
         if result is not None:
             return result
 
@@ -522,7 +1266,12 @@ def _fit_standard_forms_1d(x_data, y_data, tolerance, x_sym, feature_name, featu
         scale = float(np.exp(intercept))
         pred = scale * np.exp(slope * x_data)
         expr = _nice(scale, tol=nice_tol) * sp.exp(_nice(slope, tol=nice_tol) * x_sym)
-        result = _maybe_result(pred, expr)
+        result = _maybe_result(
+            pred,
+            expr,
+            family="exponential",
+            rationale="A log-linear transform yields a strong exponential fit.",
+        )
         if result is not None:
             return result
 
@@ -530,14 +1279,20 @@ def _fit_standard_forms_1d(x_data, y_data, tolerance, x_sym, feature_name, featu
         slope, intercept = np.polyfit(np.log(x_data), y_data, 1)
         pred = slope * np.log(x_data) + intercept
         expr = _nice(slope, tol=nice_tol) * sp.log(x_sym) + _nice(intercept, tol=nice_tol)
-        result = _maybe_result(pred, expr)
+        result = _maybe_result(
+            pred,
+            expr,
+            family="logarithmic",
+            rationale="A linear fit in log(x) space explains the samples well.",
+        )
         if result is not None:
             return result
 
     return None
 
 
-def _fit_standard_forms(x_data, y_data, tolerance, feature_names, feature_symbols):
+def _fit_standard_forms(x_data, y_data, tolerance, feature_names, feature_symbols,
+                        candidate_board=None):
     """Hybrid pre-pass for exact common forms before EML tree search."""
     if x_data.shape[1] == 1:
         name = feature_names[0]
@@ -548,6 +1303,7 @@ def _fit_standard_forms(x_data, y_data, tolerance, feature_names, feature_symbol
             feature_symbols[name],
             name,
             feature_names,
+            candidate_board=candidate_board,
         )
 
     for idx, name in enumerate(feature_names):
@@ -558,79 +1314,111 @@ def _fit_standard_forms(x_data, y_data, tolerance, feature_names, feature_symbol
             feature_symbols[name],
             name,
             feature_names,
+            candidate_board=candidate_board,
         )
         if result is not None:
             return result
 
-    x0 = x_data[:, 0]
-    x1 = x_data[:, 1]
-    name0, name1 = feature_names
-    sym0 = feature_symbols[name0]
-    sym1 = feature_symbols[name1]
-    ones = np.ones(len(y_data), dtype=np.float64)
     nice_tol = max(tolerance, 1e-5)
 
-    linear_families = [
-        [
-            (ones, sp.Integer(1), []),
-            (x0, sym0, [name0]),
-            (x1, sym1, [name1]),
-        ],
-        [
-            (ones, sp.Integer(1), []),
-            (x0, sym0, [name0]),
-            (x1, sym1, [name1]),
-            (x0 * x1, sym0 * sym1, [name0, name1]),
-        ],
-        [
-            (ones, sp.Integer(1), []),
-            (x0, sym0, [name0]),
-            (x1, sym1, [name1]),
-            (x0 * x1, sym0 * sym1, [name0, name1]),
-            (x0 ** 2, sym0 ** 2, [name0]),
-            (x1 ** 2, sym1 ** 2, [name1]),
-        ],
-    ]
-    for basis_terms in linear_families:
-        result = _fit_linear_basis(basis_terms, y_data, tolerance, feature_names, nice_tol)
+    multivariate_families = _multivariate_symbolic_basis(
+        x_data,
+        feature_names,
+        feature_symbols,
+    )
+    for family, basis_terms in multivariate_families.items():
+        rationale = {
+            "additive_multivariate": "An additive multivariate basis already explains the observed data.",
+            "pairwise_interaction_multivariate": "Pairwise multivariate interactions explain the observed data.",
+            "quadratic_multivariate": "A low-order multivariate polynomial basis explains the observed data.",
+            "full_interaction_multivariate": "A three-way interaction term materially improves the multivariate fit.",
+        }.get(family, "A multivariate basis already explains the observed data.")
+        result = _fit_linear_basis(
+            basis_terms,
+            y_data,
+            tolerance,
+            feature_names,
+            nice_tol,
+            candidate_board=candidate_board,
+            family=family,
+            rationale=rationale,
+        )
         if result is not None:
             return result
 
     if np.all(y_data > 0):
-        design = np.column_stack([ones, x0, x1])
+        design = np.column_stack(
+            [np.ones(len(y_data), dtype=np.float64)] + [x_data[:, idx] for idx in range(x_data.shape[1])]
+        )
         coeffs, *_ = np.linalg.lstsq(design, np.log(y_data), rcond=None)
         scale = float(np.exp(coeffs[0]))
-        pred = scale * np.exp(coeffs[1] * x0 + coeffs[2] * x1)
+        linear_part = sum(coeffs[idx + 1] * x_data[:, idx] for idx in range(x_data.shape[1]))
+        pred = scale * np.exp(linear_part)
         expr = _nice(scale, tol=nice_tol) * sp.exp(
-            _nice(float(coeffs[1]), tol=nice_tol) * sym0
-            + _nice(float(coeffs[2]), tol=nice_tol) * sym1
+            sum(
+                _nice(float(coeffs[idx + 1]), tol=nice_tol) * feature_symbols[name]
+                for idx, name in enumerate(feature_names)
+            )
         )
-        result = _maybe_prepass_result(pred, expr, y_data, tolerance, feature_names, feature_names)
+        result = _maybe_prepass_result(
+            pred,
+            expr,
+            y_data,
+            tolerance,
+            feature_names,
+            feature_names,
+            candidate_board=candidate_board,
+            family="separable_exponential",
+            rationale="A log-linear fit across both features suggests separable exponential structure.",
+        )
         if result is not None:
             return result
 
-    if np.all(x0 > 0) and np.all(x1 > 0) and np.all(y_data > 0):
-        design = np.column_stack([ones, np.log(x0), np.log(x1)])
+    if np.all(x_data > 0) and np.all(y_data > 0):
+        design = np.column_stack(
+            [np.ones(len(y_data), dtype=np.float64)] + [np.log(x_data[:, idx]) for idx in range(x_data.shape[1])]
+        )
         coeffs, *_ = np.linalg.lstsq(design, np.log(y_data), rcond=None)
         scale = float(np.exp(coeffs[0]))
-        pred = scale * np.power(x0, coeffs[1]) * np.power(x1, coeffs[2])
-        expr = (
-            _nice(scale, tol=nice_tol)
-            * sym0 ** _nice(float(coeffs[1]), tol=nice_tol)
-            * sym1 ** _nice(float(coeffs[2]), tol=nice_tol)
+        pred = scale * np.prod(
+            [np.power(x_data[:, idx], coeffs[idx + 1]) for idx in range(x_data.shape[1])],
+            axis=0,
         )
-        result = _maybe_prepass_result(pred, expr, y_data, tolerance, feature_names, feature_names)
+        expr = _nice(scale, tol=nice_tol) * sp.prod(
+            feature_symbols[name] ** _nice(float(coeffs[idx + 1]), tol=nice_tol)
+            for idx, name in enumerate(feature_names)
+        )
+        result = _maybe_prepass_result(
+            pred,
+            expr,
+            y_data,
+            tolerance,
+            feature_names,
+            feature_names,
+            candidate_board=candidate_board,
+            family="separable_power_law",
+            rationale="A log-log fit across both features suggests separable multiplicative structure.",
+        )
         if result is not None:
             return result
 
         coeffs, *_ = np.linalg.lstsq(design, y_data, rcond=None)
-        pred = coeffs[0] + coeffs[1] * np.log(x0) + coeffs[2] * np.log(x1)
-        expr = (
-            _nice(float(coeffs[0]), tol=nice_tol)
-            + _nice(float(coeffs[1]), tol=nice_tol) * sp.log(sym0)
-            + _nice(float(coeffs[2]), tol=nice_tol) * sp.log(sym1)
+        pred = coeffs[0] + sum(coeffs[idx + 1] * np.log(x_data[:, idx]) for idx in range(x_data.shape[1]))
+        expr = _nice(float(coeffs[0]), tol=nice_tol) + sum(
+            _nice(float(coeffs[idx + 1]), tol=nice_tol) * sp.log(feature_symbols[name])
+            for idx, name in enumerate(feature_names)
         )
-        result = _maybe_prepass_result(pred, expr, y_data, tolerance, feature_names, feature_names)
+        result = _maybe_prepass_result(
+            pred,
+            expr,
+            y_data,
+            tolerance,
+            feature_names,
+            feature_names,
+            candidate_board=candidate_board,
+            family="separable_logarithmic",
+            rationale="A linear combination of feature logs is competitive.",
+        )
         if result is not None:
             return result
 
@@ -746,20 +1534,11 @@ def symbolic_regression(x_data, y_data, max_depth=3, tolerance=1e-8,
     Returns:
         dict with expression, eml_expression, mse, depth, constants, leaf_types.
     """
-    x_data, feature_names = _coerce_feature_matrix(
+    x_data, y_data, feature_names = _coerce_regression_inputs(
         x_data,
+        y_data,
         feature_names=feature_names,
-        preserve_scalar_name=True,
     )
-    y_data = np.asarray(y_data, dtype=np.float64)
-    if y_data.ndim != 1:
-        raise ValueError("y_data must be a 1D array")
-    if len(y_data) == 0:
-        raise ValueError("y_data must be non-empty")
-    if len(x_data) != len(y_data):
-        raise ValueError("x_data and y_data must have the same length")
-    if not np.all(np.isfinite(y_data)):
-        raise ValueError("y_data must contain only finite values")
     if x_data.shape[1] > MAX_SEARCH_FEATURES:
         raise ValueError(
             f"EML tree search currently supports at most {MAX_SEARCH_FEATURES} variables"
@@ -769,6 +1548,8 @@ def symbolic_regression(x_data, y_data, max_depth=3, tolerance=1e-8,
     rng = np.random.default_rng(seed)
     feature_symbols = _feature_symbol_map(x_data, feature_names)
     leaf_options = list(feature_names) + [ONE, ZERO, C]
+    analysis = analyze_dataset(x_data, y_data, feature_names=feature_names)
+    candidate_board = _empty_candidate_board()
 
     best = _build_result(
         None,
@@ -779,35 +1560,51 @@ def symbolic_regression(x_data, y_data, max_depth=3, tolerance=1e-8,
     )
     t0 = time.time()
 
+    def _finish(result):
+        final = _finalize_result(
+            result,
+            x_data,
+            y_data,
+            feature_names,
+            analysis,
+            candidate_board,
+            tolerance,
+        )
+        if verbose:
+            _report(final, time.time() - t0)
+        return final
+
     def _update(lt, mse, consts, depth):
         if mse < best["mse"]:
-            try:
-                sym = tree_to_sympy(lt, consts or None, feature_symbols=feature_symbols)
-            except Exception:
-                sym = None
-            used_features = _used_features_from_leaf_types(lt, feature_names)
-            best.update(_build_result(
-                sym if sym is not None else _eml_str(lt, consts),
+            candidate = _tree_candidate(
+                lt,
                 mse,
+                consts,
                 depth,
-                leaf_types=lt,
-                constants=consts,
-                eml_expression=_eml_str(lt, consts),
-                strategy="eml_tree",
-                feature_names=feature_names,
-                used_features=used_features,
-            ))
+                feature_names,
+                feature_symbols,
+                y_data,
+                tolerance,
+            )
+            _register_candidate(candidate_board, candidate)
+            best.update(candidate)
             if verbose and mse < 1.0:
                 print(f"  new best  MSE={mse:.2e}  {best['expression']}")
             return mse < tolerance
         return False
 
-    prepass = _fit_standard_forms(x_data, y_data, tolerance, feature_names, feature_symbols)
+    prepass = _fit_standard_forms(
+        x_data,
+        y_data,
+        tolerance,
+        feature_names,
+        feature_symbols,
+        candidate_board=candidate_board,
+    )
     if prepass is not None:
         if verbose:
             print("[pre-pass] exact fit found")
-            _report(prepass, time.time() - t0)
-        return prepass
+        return _finish(prepass)
 
     for depth in range(1, max_depth + 1):
         n_leaves = 2 ** depth
@@ -846,9 +1643,7 @@ def symbolic_regression(x_data, y_data, max_depth=3, tolerance=1e-8,
             unique_no_const.append(cfg)
             mse = _score_prediction(pred, y_data)
             if _update(lt, mse, [], depth):
-                if verbose:
-                    _report(best, time.time() - t0)
-                return best
+                return _finish(best)
 
         if verbose:
             print(f"  phase 1  ({len(unique_no_const):>5} unique trees, no constants): "
@@ -882,9 +1677,7 @@ def symbolic_regression(x_data, y_data, max_depth=3, tolerance=1e-8,
                 if not early_stop:
                     pool.shutdown()
             if early_stop:
-                if verbose:
-                    _report(best, time.time() - t0)
-                return best
+                return _finish(best)
         else:
             for lt, nc, task_seed, task_feature_names in task_specs:
                 mse, lt, nc, consts = _screen_one(
@@ -894,18 +1687,14 @@ def symbolic_regression(x_data, y_data, max_depth=3, tolerance=1e-8,
                     continue
                 candidates.append((mse, lt, nc, consts))
                 if _update(lt, mse, consts, depth) and mse < tolerance:
-                    if verbose:
-                        _report(best, time.time() - t0)
-                    return best
+                    return _finish(best)
 
         if verbose:
             print(f"  phase 2  ({len(has_const):>5} trees, screened):    "
                   f"best MSE = {best['mse']:.2e}")
 
         if best["mse"] < tolerance:
-            if verbose:
-                _report(best, time.time() - t0)
-            return best
+            return _finish(best)
 
         # Phase 3: full optimisation on top candidates
         candidates.sort(key=lambda c: c[0])
@@ -921,18 +1710,27 @@ def symbolic_regression(x_data, y_data, max_depth=3, tolerance=1e-8,
             )
             if consts is None:
                 continue
+            _register_candidate(
+                candidate_board,
+                _tree_candidate(
+                    lt,
+                    mse,
+                    consts,
+                    depth,
+                    feature_names,
+                    feature_symbols,
+                    y_data,
+                    tolerance,
+                ),
+            )
             if _update(lt, mse, consts, depth) and mse < tolerance:
-                if verbose:
-                    _report(best, time.time() - t0)
-                return best
+                return _finish(best)
 
         if verbose:
             print(f"  phase 3  (top 30, full optimise):   "
                   f"best MSE = {best['mse']:.2e}")
 
-    if verbose:
-        _report(best, time.time() - t0)
-    return best
+    return _finish(best)
 
 
 def _report(b, elapsed):
@@ -940,10 +1738,16 @@ def _report(b, elapsed):
     print(f"  Formula : {b.get('expression') or 'none'}")
     print(f"  EML tree: {b.get('eml_expression') or 'n/a'}")
     print(f"  MSE     : {b['mse']:.2e}")
+    print(f"  Quality : {b.get('quality') or 'n/a'}")
     depth = b.get("depth")
     depth_label = depth if depth is not None else "n/a"
     used = ", ".join(b.get("used_features") or []) or "n/a"
     print(f"  Features: {used}")
+    confidence = b.get("confidence", {})
+    if confidence:
+        print(f"  Trust   : {confidence.get('label', 'n/a')} ({confidence.get('score', 0.0):.2f})")
+    failures = ", ".join(b.get("failure_modes") or []) or "none"
+    print(f"  Alerts  : {failures}")
     print(f"  Depth   : {depth_label}   ({elapsed:.1f}s)")
     print(f"  {'='*50}")
 
@@ -1007,17 +1811,7 @@ def main():
                             tolerance=args.tolerance, verbose=not args.quiet,
                             seed=args.seed, feature_names=feature_names)
     if args.output_json:
-        print(json.dumps({
-            "expression": r["expression"],
-            "eml_expression": r["eml_expression"],
-            "depth": r["depth"],
-            "strategy": r["strategy"],
-            "mse": r["mse"],
-            "constants": r["constants"],
-            "leaf_types": r["leaf_types"],
-            "feature_names": r["feature_names"],
-            "used_features": r["used_features"],
-        }, indent=2))
+        print(json.dumps(r, indent=2))
 
 
 def _run_demo():

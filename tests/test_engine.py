@@ -3,7 +3,7 @@ import unittest
 import numpy as np
 import sympy as sp
 
-from eml import regress
+from eml import analyze, regress
 from eml.engine import C, ONE, X, ZERO, evaluate_tree, tree_to_sympy
 
 
@@ -157,6 +157,58 @@ class RegressionTests(unittest.TestCase):
         self.assertIn("length", result["expression"] or "")
         self.assertIn("time", result["expression"] or "")
 
+    def test_three_variable_prepass_finds_common_power_law_form(self):
+        m1, m2, r = np.meshgrid(
+            np.linspace(1.0, 4.0, 8),
+            np.linspace(2.0, 5.0, 7),
+            np.linspace(1.0, 3.0, 6),
+        )
+        x_matrix = np.column_stack([m1.ravel(), m2.ravel(), r.ravel()])
+        y_data = (m1.ravel() * m2.ravel()) / (r.ravel() ** 2)
+
+        result = regress(
+            x_matrix,
+            y_data,
+            max_depth=3,
+            verbose=False,
+            feature_names=["m1", "m2", "r"],
+        )
+
+        self.assertLess(result["mse"], 1e-8)
+        self.assertEqual(result["strategy"], "prepass")
+        self.assertEqual(result["feature_names"], ["m1", "m2", "r"])
+        self.assertEqual(result["used_features"], ["m1", "m2", "r"])
+        self.assertIn("m1", result["expression"] or "")
+        self.assertIn("m2", result["expression"] or "")
+        self.assertIn("r", result["expression"] or "")
+
+    def test_analyze_routes_common_families(self):
+        x_data = np.linspace(0.2, 4.0, 120)
+        y_data = np.exp(x_data)
+
+        analysis = analyze(x_data, y_data)
+
+        self.assertTrue(analysis["should_attempt_regression"])
+        self.assertEqual(analysis["recommended_mode"], "instant")
+        self.assertIn("looks_exponential", analysis["flags"])
+        self.assertGreaterEqual(len(analysis["likely_families"]), 1)
+        self.assertEqual(analysis["feature_names"], ["x"])
+
+    def test_regress_returns_structured_llm_metadata(self):
+        x_data = np.linspace(0.2, 4.0, 120)
+        y_data = np.exp(x_data)
+
+        result = regress(x_data, y_data, verbose=False)
+
+        self.assertEqual(result["quality"], "exact")
+        self.assertEqual(result["confidence"]["label"], "high")
+        self.assertEqual(result["verification"]["status"], "verified")
+        self.assertIsInstance(result["analysis"], dict)
+        self.assertIsInstance(result["candidates"], list)
+        self.assertGreaterEqual(len(result["candidates"]), 1)
+        self.assertIn("why_best", result["guidance"])
+        self.assertEqual(result["analysis"]["feature_names"], ["x"])
+
     def test_two_variable_tree_search_finds_direct_eml_form(self):
         x0 = np.linspace(0.1, 1.2, 80)
         x1 = np.linspace(1.1, 2.8, 80)
@@ -191,7 +243,7 @@ class RegressionTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             regress([1.0, np.nan], [1.0, 2.0], verbose=False)
         with self.assertRaises(ValueError):
-            regress(np.ones((10, 3)), np.ones(10), verbose=False)
+            regress(np.ones((10, 4)), np.ones(10), verbose=False)
         with self.assertRaises(ValueError):
             regress(np.ones((10, 2)), np.ones(10), verbose=False, feature_names=["only_one"])
 
