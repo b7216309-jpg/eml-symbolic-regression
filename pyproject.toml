@@ -1,0 +1,41 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.backends._legacy:_Backend"
+
+[project]
+name = "eml-symbolic-regression"
+version = "0.1.0"
+description = "Discover exact mathematical formulas from data using a single operator: eml(a,b) = exp(a) - ln(b)"
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.10"
+authors = [
+    {name = "Aezaror"},
+]
+keywords = ["symbolic-regression", "mathematics", "llm-tools", "function-calling", "eml"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Science/Research",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Mathematics",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+    "numpy>=1.24",
+    "scipy>=1.10",
+    "sympy>=1.12",
+]
+
+[project.scripts]
+eml-regress = "eml.engine:main"
+
+[project.urls]
+Repository = "https://github.com/Aezaror/eml-symbolic-regression"
+
+[tool.setuptools.packages.find]
+include = ["eml*"]
