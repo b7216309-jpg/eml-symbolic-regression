@@ -30,6 +30,9 @@ y = np.exp(x)  # pretend we don't know this
 
 result = regress(x, y)
 print(result["expression"])  # exp(x)
+
+# Reproducible search when you want stable comparisons
+result = regress(x, y, seed=123)
 ```
 
 ## Why this exists
@@ -95,6 +98,9 @@ print(result["mse"])             # ~6e-32
 ```bash
 # From expression (generates data, discovers formula)
 eml-regress --func "exp(x)" --range 0.1 5
+
+# Deterministic search
+eml-regress --func "sin(x)" --range 0.1 5 --seed 123
 
 # From JSON data
 echo '{"x": [1,2,3,4], "y": [2.72,7.39,20.09,54.60]}' | eml-regress

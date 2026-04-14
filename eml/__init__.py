@@ -24,7 +24,7 @@ __version__ = "0.1.0"
 __all__ = ["regress", "symbolic_regression", "evaluate_tree", "eml_np"]
 
 
-def regress(x, y, max_depth=3, tolerance=1e-8, verbose=False, workers=None):
+def regress(x, y, max_depth=3, tolerance=1e-8, verbose=False, workers=None, seed=None):
     """Discover the formula behind your data.
 
     Args:
@@ -34,6 +34,7 @@ def regress(x, y, max_depth=3, tolerance=1e-8, verbose=False, workers=None):
         tolerance: Stop early if MSE drops below this. Default 1e-8.
         verbose: Print search progress. Default False.
         workers: Number of parallel workers. Default auto.
+        seed: Optional RNG seed for deterministic search.
 
     Returns:
         Result dict with keys:
@@ -50,5 +51,6 @@ def regress(x, y, max_depth=3, tolerance=1e-8, verbose=False, workers=None):
         tolerance=tolerance,
         verbose=verbose,
         workers=workers,
+        seed=seed,
         max_random=10000,
     )

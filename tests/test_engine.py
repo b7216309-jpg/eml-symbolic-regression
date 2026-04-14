@@ -76,8 +76,20 @@ class RegressionTests(unittest.TestCase):
             with self.subTest(name=name):
                 result = regress(x_data, y_data, max_depth=3, verbose=False)
                 self.assertLess(result["mse"], 1e-8)
-                self.assertNotIn("eps", result["expression"] or "")
-                self.assertNotIn("I*pi", result["expression"] or "")
+                for banned in ("eps", "I*pi", "zoo", "nan"):
+                    self.assertNotIn(banned, result["expression"] or "")
+
+    def test_fixed_seed_makes_search_reproducible(self):
+        x_data = np.linspace(0.1, 4.0, 40)
+        y_data = np.sin(x_data)
+
+        result_a = regress(x_data, y_data, max_depth=1, verbose=False, workers=1, seed=1234)
+        result_b = regress(x_data, y_data, max_depth=1, verbose=False, workers=1, seed=1234)
+
+        self.assertEqual(result_a["leaf_types"], result_b["leaf_types"])
+        self.assertEqual(result_a["expression"], result_b["expression"])
+        self.assertAlmostEqual(result_a["mse"], result_b["mse"])
+        np.testing.assert_allclose(result_a["constants"], result_b["constants"], rtol=0, atol=1e-12)
 
     def test_regress_rejects_invalid_input(self):
         with self.assertRaises(ValueError):

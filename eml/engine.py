@@ -14,7 +14,7 @@ Grammar:           S -> x | 0 | 1 | c | eml(S, S)
 """
 
 import numpy as np
-from scipy.optimize import minimize
+from scipy.optimize import basinhopping, minimize
 from itertools import product
 from concurrent.futures import ProcessPoolExecutor
 import sympy as sp
@@ -38,6 +38,16 @@ C    = "c"   # trainable constant (fitted to data)
 LEAF_OPTIONS = [X, ONE, ZERO, C]
 EXHAUSTIVE_LIMIT = 20000
 MIN_VALID_FRACTION = 0.9
+SAMPLE_BUCKET_WEIGHTS = {
+    0: 0.10,
+    1: 0.30,
+    2: 0.30,
+    3: 0.20,
+    4: 0.10,
+}
+
+_WORKER_X_DATA = None
+_WORKER_Y_DATA = None
 
 
 # ── Core EML operator ──────────────────────────────────────────────
@@ -121,6 +131,86 @@ def _should_prune_config(cfg):
     return False
 
 
+def _sample_one_config(n_leaves, constant_count, rng):
+    """Sample one leaf configuration with a target constant count."""
+    if n_leaves < 1:
+        raise ValueError("n_leaves must be positive")
+
+    max_constants = max(0, n_leaves - 1)
+    constant_count = int(np.clip(constant_count, 0, max_constants))
+    cfg = [None] * n_leaves
+
+    if constant_count:
+        c_positions = rng.choice(n_leaves, size=constant_count, replace=False)
+        for idx in np.atleast_1d(c_positions):
+            cfg[int(idx)] = C
+
+    non_const_positions = [i for i, value in enumerate(cfg) if value is None]
+    x_position = int(rng.choice(non_const_positions))
+    cfg[x_position] = X
+
+    remaining = [i for i in non_const_positions if i != x_position]
+    if remaining:
+        choices = rng.choice([X, ONE, ZERO], size=len(remaining), replace=True)
+        for idx, choice in zip(remaining, choices):
+            cfg[idx] = str(choice)
+    return tuple(cfg)
+
+
+def _sample_configs(n_leaves, max_random, rng):
+    """Stratified random sampling biased toward 1-2 constant trees."""
+    if max_random <= 0:
+        return []
+
+    sampled = {}
+    bucket_counts = {bucket: 0 for bucket in SAMPLE_BUCKET_WEIGHTS}
+    bucket_targets = {
+        bucket: max(1, int(round(max_random * weight)))
+        for bucket, weight in SAMPLE_BUCKET_WEIGHTS.items()
+    }
+
+    # Keep the total close to max_random after rounding.
+    overflow = sum(bucket_targets.values()) - max_random
+    if overflow > 0:
+        for bucket in sorted(bucket_targets, reverse=True):
+            if overflow <= 0:
+                break
+            reducible = min(overflow, bucket_targets[bucket] - 1)
+            bucket_targets[bucket] -= reducible
+            overflow -= reducible
+
+    for bucket, target in bucket_targets.items():
+        attempts = 0
+        while bucket_counts[bucket] < target:
+            if attempts > target * 20:
+                break
+            attempts += 1
+            if bucket == 4:
+                constant_count = int(rng.integers(4, max(5, n_leaves)))
+            else:
+                constant_count = bucket
+            cfg = _sample_one_config(n_leaves, constant_count, rng)
+            if cfg not in sampled:
+                sampled[cfg] = None
+                bucket_counts[min(cfg.count(C), 4)] += 1
+
+    while len(sampled) < max_random:
+        constant_count = int(rng.integers(0, max(1, n_leaves)))
+        cfg = _sample_one_config(n_leaves, constant_count, rng)
+        if cfg not in sampled:
+            sampled[cfg] = None
+            bucket_counts[min(cfg.count(C), 4)] += 1
+
+    return list(sampled)
+
+
+def _init_screen_worker(x_data, y_data):
+    """Load immutable arrays into each worker once."""
+    global _WORKER_X_DATA, _WORKER_Y_DATA
+    _WORKER_X_DATA = x_data
+    _WORKER_Y_DATA = y_data
+
+
 # ── Tree evaluation ─────────────────────────────────────────────────
 
 def evaluate_tree(leaf_types, x_data, constants=None):
@@ -150,19 +240,33 @@ def evaluate_tree(leaf_types, x_data, constants=None):
 # ── Constant optimisation ──────────────────────────────────────────
 
 def optimize_constants(leaf_types, x_data, y_data, n_constants,
-                       restarts=3, quick=False):
+                       restarts=3, quick=False, rng=None, use_basinhopping=None):
     """Fit trainable constants via Nelder-Mead.
 
     ~7ms per call (quick), ~15ms (full). Near-instant for 1-4 params.
     """
+    if n_constants <= 0:
+        pred = evaluate_tree(leaf_types, x_data, [])
+        return _score_prediction(pred, y_data), []
+
+    if rng is None:
+        rng = np.random.default_rng()
+
     if quick:
         restarts = 1
-        maxiter = max(200, 150 * n_constants)
+        maxiter = max(200, 100 * n_constants)
+        use_basinhopping = False
     else:
         maxiter = max(2000, 500 * n_constants)
-
-    rng = np.random.default_rng()
+        if use_basinhopping is None:
+            use_basinhopping = n_constants >= 3
+        if use_basinhopping:
+            maxiter = max(400, 200 * n_constants)
     base_scales = [0.5, 2.0, 10.0]
+    minimizer_kwargs = {
+        "method": "Nelder-Mead",
+        "options": {"maxiter": maxiter, "xatol": 1e-12, "fatol": 1e-12},
+    }
 
     def objective(c):
         pred = evaluate_tree(leaf_types, x_data, c)
@@ -170,18 +274,32 @@ def optimize_constants(leaf_types, x_data, y_data, n_constants,
         return mse if np.isfinite(mse) else 1e20
 
     best_mse, best_c = float("inf"), None
-    for r in range(restarts):
+    effective_restarts = 1 if use_basinhopping else restarts
+    for r in range(effective_restarts):
         if r < len(base_scales):
             scale = base_scales[r]
         else:
             scale = 10 ** rng.uniform(-1.0, 1.0)
         c0 = rng.normal(size=n_constants) * scale
         try:
-            res = minimize(objective, c0, method="Nelder-Mead",
-                           options={"maxiter": maxiter, "xatol": 1e-12, "fatol": 1e-12})
-            if res.fun < best_mse:
-                best_mse = res.fun
-                best_c = res.x.tolist()
+            if use_basinhopping:
+                res = basinhopping(
+                    objective,
+                    c0,
+                    minimizer_kwargs=minimizer_kwargs,
+                    niter=max(4, 2 * n_constants),
+                    T=1.0,
+                    stepsize=2.0,
+                    seed=int(rng.integers(0, 2**32 - 1)),
+                )
+            else:
+                res = minimize(objective, c0, **minimizer_kwargs)
+
+            fun = float(getattr(res, "fun", float("inf")))
+            x_opt = getattr(res, "x", None)
+            if x_opt is not None and fun < best_mse:
+                best_mse = fun
+                best_c = np.asarray(x_opt, dtype=float).tolist()
         except Exception:
             continue
     return best_mse, best_c
@@ -349,13 +467,24 @@ def _eml_str(leaf_types, constants=None):
 
 def _screen_one(args):
     """Worker for parallel Phase 2 screening."""
-    lt, x_data, y_data, nc = args
-    mse, consts = optimize_constants(lt, x_data, y_data, nc, quick=True)
+    if len(args) == 3:
+        lt, nc, seed = args
+        x_data, y_data = _WORKER_X_DATA, _WORKER_Y_DATA
+    else:
+        lt, x_data, y_data, nc, seed = args
+    mse, consts = optimize_constants(
+        lt,
+        x_data,
+        y_data,
+        nc,
+        quick=True,
+        rng=np.random.default_rng(seed),
+    )
     return mse, lt, nc, consts
 
 
 def symbolic_regression(x_data, y_data, max_depth=3, tolerance=1e-8,
-                        verbose=True, max_random=10000, workers=None):
+                        verbose=True, max_random=10000, workers=None, seed=None):
     """Search for the simplest EML tree that fits the data.
 
     A cheap exact-form pre-pass runs before the EML search. If that misses,
@@ -372,6 +501,7 @@ def symbolic_regression(x_data, y_data, max_depth=3, tolerance=1e-8,
         verbose:    Print progress.
         max_random: Sample count when exhaustive search is too large.
         workers:    Parallel workers (default: auto).
+        seed:       Optional RNG seed for deterministic search/optimisation.
 
     Returns:
         dict with expression, eml_expression, mse, depth, constants, leaf_types.
@@ -388,6 +518,7 @@ def symbolic_regression(x_data, y_data, max_depth=3, tolerance=1e-8,
         raise ValueError("x_data and y_data must contain only finite values")
     if workers is None:
         workers = min(os.cpu_count() or 4, 8)
+    rng = np.random.default_rng(seed)
 
     best = _build_result(None, float("inf"), depth=None)
     t0 = time.time()
@@ -427,8 +558,7 @@ def symbolic_regression(x_data, y_data, max_depth=3, tolerance=1e-8,
         if exhaustive:
             all_cfgs = list(product(LEAF_OPTIONS, repeat=n_leaves))
         else:
-            all_cfgs = [tuple(np.random.choice(LEAF_OPTIONS, n_leaves))
-                        for _ in range(max_random)]
+            all_cfgs = _sample_configs(n_leaves, max_random, rng)
 
         all_cfgs = [c for c in all_cfgs if X in c]
 
@@ -466,20 +596,38 @@ def symbolic_regression(x_data, y_data, max_depth=3, tolerance=1e-8,
 
         # Phase 2: parallel quick screen
         has_const = [c for c in all_cfgs if C in c and not _should_prune_config(c)]
-        tasks = [(list(cfg), x_data, y_data, list(cfg).count(C))
-                 for cfg in has_const]
+        task_specs = [
+            (list(cfg), list(cfg).count(C), int(rng.integers(0, 2**32 - 1)))
+            for cfg in has_const
+        ]
         candidates = []
 
-        if len(tasks) > 100:
-            with ProcessPoolExecutor(max_workers=workers) as pool:
-                for mse, lt, nc, consts in pool.map(_screen_one, tasks, chunksize=64):
+        if len(task_specs) > 100 and workers > 1:
+            pool = ProcessPoolExecutor(
+                max_workers=workers,
+                initializer=_init_screen_worker,
+                initargs=(x_data, y_data),
+            )
+            early_stop = False
+            try:
+                for mse, lt, nc, consts in pool.map(_screen_one, task_specs, chunksize=64):
                     if consts is None:
                         continue
                     candidates.append((mse, lt, nc, consts))
-                    _update(lt, mse, consts, depth)
+                    if _update(lt, mse, consts, depth) and mse < tolerance:
+                        early_stop = True
+                        pool.shutdown(wait=False, cancel_futures=True)
+                        break
+            finally:
+                if not early_stop:
+                    pool.shutdown()
+            if early_stop:
+                if verbose:
+                    _report(best, time.time() - t0)
+                return best
         else:
-            for t in tasks:
-                mse, lt, nc, consts = _screen_one(t)
+            for lt, nc, task_seed in task_specs:
+                mse, lt, nc, consts = _screen_one((lt, x_data, y_data, nc, task_seed))
                 if consts is None:
                     continue
                 candidates.append((mse, lt, nc, consts))
@@ -500,7 +648,14 @@ def symbolic_regression(x_data, y_data, max_depth=3, tolerance=1e-8,
         # Phase 3: full optimisation on top candidates
         candidates.sort(key=lambda c: c[0])
         for _, lt, nc, _ in candidates[:30]:
-            mse, consts = optimize_constants(lt, x_data, y_data, nc)
+            mse, consts = optimize_constants(
+                lt,
+                x_data,
+                y_data,
+                nc,
+                rng=np.random.default_rng(int(rng.integers(0, 2**32 - 1))),
+                use_basinhopping=False,
+            )
             if consts is None:
                 continue
             if _update(lt, mse, consts, depth) and mse < tolerance:
@@ -550,6 +705,8 @@ def main():
                     help="Maximum tree depth 1-4 (default: 3)")
     ap.add_argument("--tolerance", type=float, default=1e-8,
                     help="MSE tolerance for early stop (default: 1e-8)")
+    ap.add_argument("--seed", type=int,
+                    help="RNG seed for deterministic search")
     ap.add_argument("--output-json", action="store_true",
                     help="Output result as JSON")
     ap.add_argument("--quiet", action="store_true",
@@ -571,6 +728,7 @@ def main():
         d = json.load(sys.stdin)
         xd, yd = np.array(d["x"], float), np.array(d["y"], float)
         args.max_depth = d.get("max_depth", args.max_depth)
+        args.seed = d.get("seed", args.seed)
         args.output_json = True
         args.quiet = True
     else:
@@ -578,7 +736,8 @@ def main():
         return
 
     r = symbolic_regression(xd, yd, max_depth=args.max_depth,
-                            tolerance=args.tolerance, verbose=not args.quiet)
+                            tolerance=args.tolerance, verbose=not args.quiet,
+                            seed=args.seed)
     if args.output_json:
         print(json.dumps({
             "expression": r["expression"],
