@@ -1,14 +1,21 @@
 ---
-name: symbolic-regression
+name: eml-symbolic-regression
 description: Discover mathematical formulas from numerical data using EML trees
-version: "0.1.0"
-tags:
-  - math
-  - science
-  - data-analysis
-  - symbolic-regression
-requires_tools:
-  - eml_symbolic_regression
+version: "1.0.0"
+author: Aezaror
+license: MIT
+metadata:
+  hermes:
+    tags:
+      - math
+      - science
+      - data-analysis
+      - symbolic-regression
+      - formula-discovery
+    requires_tools:
+      - eml_symbolic_regression
+    related_skills:
+      - data-analysis
 ---
 
 # Symbolic Regression with EML

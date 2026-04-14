@@ -1,8 +1,17 @@
 """
 EML Symbolic Regression -- Hermes Agent native tool module.
 
-Drop this file into your hermes-agent/tools/ directory,
-then make sure it gets imported during agent startup.
+Integration requires TWO changes to hermes-agent:
+
+1. Add this import to tools/model_tools.py in _discover_tools():
+       "tools.eml_tool",
+
+2. Add to tools/toolsets.py:
+       - Add "eml_symbolic_regression" to _HERMES_CORE_TOOLS
+       - Or create a toolset: "math": ToolsetDef("Mathematical tools",
+             tools=["eml_symbolic_regression"])
+
+Or skip both and use the plugin system instead (see README).
 
 Requires: pip install eml-symbolic-regression
 """
@@ -10,7 +19,19 @@ Requires: pip install eml-symbolic-regression
 import json
 import numpy as np
 
-# ── Schema (inner format -- registry wraps it in {"type":"function",...}) ──
+
+# ── Availability check ──────────────────────────────────────────────
+
+def _check_eml_available() -> bool:
+    """Check if eml-symbolic-regression is installed."""
+    try:
+        from eml import regress  # noqa: F401
+        return True
+    except ImportError:
+        return False
+
+
+# ── Schema ──────────────────────────────────────────────────────────
 
 EML_SCHEMA = {
     "name": "eml_symbolic_regression",
@@ -55,25 +76,35 @@ EML_SCHEMA = {
 # ── Handler ─────────────────────────────────────────────────────────
 
 def _handle_eml_regression(args: dict, **kwargs) -> str:
-    """Hermes tool handler. Receives parsed args, returns JSON string."""
+    """Hermes tool handler. Receives parsed args dict, returns JSON string.
+
+    kwargs may contain task_id, user_task from Hermes dispatch.
+    """
+    # Import helpers -- fall back to plain json if not inside hermes-agent
+    try:
+        from tools.registry import tool_error, tool_result
+    except ImportError:
+        tool_error = lambda msg, **kw: json.dumps({"error": msg, **kw})
+        tool_result = lambda **kw: json.dumps(kw)
+
     try:
         from eml import regress
     except ImportError:
-        return json.dumps({
-            "error": "eml-symbolic-regression not installed. "
-                     "Run: pip install eml-symbolic-regression"
-        })
+        return tool_error(
+            "eml-symbolic-regression not installed. "
+            "Run: pip install eml-symbolic-regression"
+        )
 
     x = args.get("x")
     y = args.get("y")
     max_depth = args.get("max_depth", 3)
 
     if not x or not y:
-        return json.dumps({"error": "Both 'x' and 'y' arrays are required."})
+        return tool_error("Both 'x' and 'y' arrays are required.")
     if len(x) != len(y):
-        return json.dumps({"error": f"x ({len(x)}) and y ({len(y)}) must be same length."})
+        return tool_error(f"x ({len(x)}) and y ({len(y)}) must be same length.")
     if len(x) < 3:
-        return json.dumps({"error": "Need at least 3 data points (20+ recommended)."})
+        return tool_error("Need at least 3 data points (20+ recommended).")
 
     try:
         result = regress(
@@ -83,7 +114,7 @@ def _handle_eml_regression(args: dict, **kwargs) -> str:
             verbose=False,
         )
     except Exception as e:
-        return json.dumps({"error": f"Regression failed: {str(e)}"})
+        return tool_error(f"Regression failed: {str(e)}")
 
     mse = result["mse"]
     quality = "exact" if mse < 1e-8 else "approximate" if mse < 1e-1 else "rough"
@@ -99,21 +130,23 @@ def _handle_eml_regression(args: dict, **kwargs) -> str:
 
 
 # ── Registration ────────────────────────────────────────────────────
-# This runs at import time when Hermes loads the tools/ directory.
 
 def register(registry):
-    """Called by Hermes tool loader, or call manually after import."""
+    """Register the EML tool with a Hermes ToolRegistry instance."""
     registry.register(
         name="eml_symbolic_regression",
         toolset="math",
         schema=EML_SCHEMA,
         handler=_handle_eml_regression,
-        emoji="🔬",
+        check_fn=_check_eml_available,
+        requires_env=[],
+        is_async=False,
+        emoji="\U0001f52c",  # microscope
         max_result_size_chars=10_000,
     )
 
 
-# Auto-register if the Hermes registry singleton is available
+# Auto-register when imported inside hermes-agent
 try:
     from tools.registry import registry
     register(registry)

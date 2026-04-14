@@ -131,19 +131,30 @@ Pick the one that fits your setup:
 
 #### Option A -- Native tool (tightest integration)
 
-Copy `hermes/hermes_tool.py` into your `hermes-agent/tools/` directory.
-Make sure it gets imported at startup. Done.
+Three steps:
+
+1. Copy `hermes/hermes_tool.py` into `hermes-agent/tools/eml_tool.py`
+
+2. Register the import in `tools/model_tools.py` -- add to the `_modules` list in `_discover_tools()`:
+   ```python
+   "tools.eml_tool",
+   ```
+
+3. Make the tool visible to the LLM -- in `tools/toolsets.py`, add `"eml_symbolic_regression"` to `_HERMES_CORE_TOOLS`.
 
 ```python
-# hermes_tool.py auto-registers with the Hermes ToolRegistry:
-#   name:    "eml_symbolic_regression"
-#   toolset: "math"
-#   handler: Python callable (no subprocess, no shell)
+# The tool auto-registers with the Hermes ToolRegistry at import:
+#   name:     "eml_symbolic_regression"
+#   toolset:  "math"
+#   handler:  Python callable (no subprocess, no shell)
+#   check_fn: validates eml package is installed
 ```
 
-The handler calls `from eml import regress` directly -- no stdin/stdout, no CLI wrapping. This is how Hermes native tools work: Python function in, JSON string out.
+The handler calls `from eml import regress` directly and uses `tool_error()` / `tool_result()` from the Hermes registry helpers.
 
 #### Option B -- MCP server (no code changes to Hermes)
+
+Uses the official MCP Python SDK (`FastMCP`) so the framing/protocol always matches what hermes-agent expects. Requires: `pip install mcp`
 
 Add to `~/.hermes/config.yaml`:
 
@@ -159,7 +170,7 @@ Hermes auto-discovers the tool as `mcp_eml_eml_symbolic_regression` via the MCP 
 
 #### Option C -- Skill only (prompt-based guidance)
 
-Copy `hermes/skill/` into your `hermes-agent/skills/math/symbolic-regression/` directory. This adds a skill entry that teaches Hermes *when* and *how* to use the tool, including fallback strategies when results are approximate.
+Copy the `hermes/skill/` directory into `hermes-agent/skills/math/eml-symbolic-regression/`. The SKILL.md uses the correct Hermes frontmatter format (`metadata.hermes.tags`, `metadata.hermes.requires_tools`) so it integrates with skill discovery and search. Teaches Hermes *when* and *how* to use the tool, including fallback strategies when results are approximate.
 
 ### What the LLM needs to do
 
