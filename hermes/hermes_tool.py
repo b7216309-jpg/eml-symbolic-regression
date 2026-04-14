@@ -48,14 +48,36 @@ EML_SCHEMA = {
         "type": "object",
         "properties": {
             "x": {
-                "type": "array",
-                "items": {"type": "number"},
-                "description": "Input x values (at least 20 points, avoid x=0)",
+                "description": (
+                    "Input values. Use a 1D array for single-variable regression "
+                    "or a 2D matrix shaped [n_samples][n_features] for multivariable "
+                    "regression (currently up to 2 features)."
+                ),
+                "oneOf": [
+                    {
+                        "type": "array",
+                        "items": {"type": "number"},
+                    },
+                    {
+                        "type": "array",
+                        "items": {
+                            "type": "array",
+                            "items": {"type": "number"},
+                        },
+                    },
+                ],
             },
             "y": {
                 "type": "array",
                 "items": {"type": "number"},
                 "description": "Output y values corresponding to each x",
+            },
+            "feature_names": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": (
+                    "Optional feature names for matrix inputs. Defaults to x0, x1, ..."
+                ),
             },
             "max_depth": {
                 "type": "integer",
@@ -95,23 +117,28 @@ def _handle_eml_regression(args: dict, **kwargs) -> str:
             "Run: pip install eml-symbolic-regression"
         )
 
-    x = args.get("x")
+    x = args.get("X", args.get("x"))
     y = args.get("y")
+    feature_names = args.get("feature_names")
     max_depth = args.get("max_depth", 3)
 
     if not x or not y:
         return tool_error("Both 'x' and 'y' arrays are required.")
-    if len(x) != len(y):
-        return tool_error(f"x ({len(x)}) and y ({len(y)}) must be same length.")
-    if len(x) < 3:
+    if len(y) < 3:
         return tool_error("Need at least 3 data points (20+ recommended).")
 
     try:
+        x_array = np.array(x, dtype=np.float64)
+        y_array = np.array(y, dtype=np.float64)
+        sample_count = len(x_array)
+        if sample_count != len(y_array):
+            return tool_error(f"x ({sample_count}) and y ({len(y_array)}) must be same length.")
         result = regress(
-            np.array(x, dtype=np.float64),
-            np.array(y, dtype=np.float64),
+            x_array,
+            y_array,
             max_depth=int(max_depth),
             verbose=False,
+            feature_names=feature_names,
         )
     except Exception as e:
         return tool_error(f"Regression failed: {str(e)}")
@@ -127,6 +154,8 @@ def _handle_eml_regression(args: dict, **kwargs) -> str:
         "mse": mse,
         "quality": quality,
         "constants": result["constants"],
+        "feature_names": result.get("feature_names", []),
+        "used_features": result.get("used_features", []),
     })
 
 

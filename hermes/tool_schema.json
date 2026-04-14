@@ -5,14 +5,30 @@
     "type": "object",
     "properties": {
       "x": {
-        "type": "array",
-        "items": { "type": "number" },
-        "description": "Input x values (at least 20 points, avoid x=0)"
+        "description": "Input values. Use a 1D array for single-variable regression or a 2D matrix shaped [n_samples][n_features] for multivariable regression (currently up to 2 features).",
+        "oneOf": [
+          {
+            "type": "array",
+            "items": { "type": "number" }
+          },
+          {
+            "type": "array",
+            "items": {
+              "type": "array",
+              "items": { "type": "number" }
+            }
+          }
+        ]
       },
       "y": {
         "type": "array",
         "items": { "type": "number" },
         "description": "Output y values corresponding to each x"
+      },
+      "feature_names": {
+        "type": "array",
+        "items": { "type": "string" },
+        "description": "Optional feature names for matrix inputs. Defaults to x0, x1, ..."
       },
       "max_depth": {
         "type": "integer",

@@ -17,16 +17,16 @@
 
 # EML Symbolic Regression
 
-**Discover exact mathematical formulas from raw numerical data.**
+Discover exact mathematical formulas from raw numerical data.
 
-Feed in data points. Get back `exp(x)`, `1/x`, `ln(x)` -- not a neural net approximation, not a polynomial fit, but the actual symbolic formula. The engine now uses a hybrid exact-form pre-pass before falling back to EML tree search, so simple closed forms can return immediately while harder functions still use the uniform EML grammar.
+Feed in data points. Get back `exp(x)`, `1/x`, `ln(x)`, `x0 + x1`, or `exp(x0) - log(x1)` -- not a neural net approximation, not a polynomial fit, but the actual symbolic formula. The engine uses a hybrid exact-form pre-pass before falling back to EML tree search, so simple closed forms return immediately while harder functions still use the uniform EML grammar.
 
 ```python
 from eml import regress
 import numpy as np
 
 x = np.linspace(0.1, 5, 200)
-y = np.exp(x)  # pretend we don't know this
+y = np.exp(x)  # pretend we do not know this
 
 result = regress(x, y)
 print(result["expression"])  # exp(x)
@@ -39,7 +39,7 @@ result = regress(x, y, seed=123)
 
 ### The paper
 
-In 2026, Andrzej Odrzywołek proved that one binary operator is enough to generate **all elementary functions** -- exponentials, logarithms, trigonometry, powers, roots, polynomials. Everything on a scientific calculator. One operator:
+In 2026, Andrzej Odrzywolek proved that one binary operator is enough to generate all elementary functions -- exponentials, logarithms, trigonometry, powers, roots, polynomials. Everything on a scientific calculator. One operator:
 
 ```
 eml(a, b) = exp(a) - ln(b)
@@ -60,7 +60,7 @@ You have data. You need the formula. Traditional options:
 | GP symbolic regression (PySR etc.) | Large grammar, slow, non-deterministic |
 | Ask an LLM | Hallucinated arithmetic, wrong answers |
 
-EML symbolic regression searches a **minimal, complete grammar**. One operator, exhaustive or stratified search at shallow depths, gradient-free constant optimisation, and a cheap closed-form pre-pass for standard families.
+EML symbolic regression searches a minimal, complete grammar. One operator, exhaustive or stratified search at shallow depths, gradient-free constant optimisation, and a cheap closed-form pre-pass for standard families.
 
 ---
 
@@ -71,6 +71,16 @@ pip install -e .
 ```
 
 Dependencies: `numpy`, `scipy`, `sympy`. No GPU needed.
+
+---
+
+## Current Status
+
+- Hybrid exact-form pre-pass for common 1D and 2D families before EML tree search
+- 1D vector input plus 2-feature matrix input with optional custom `feature_names`
+- Deterministic search with `seed=` for repeatable comparisons
+- Native Hermes tool integration plus skill-only guidance
+- Dedicated multivariable benchmark script at `examples/benchmark_multivariable.py`
 
 ---
 
@@ -95,13 +105,38 @@ print(result["eml_expression"])  # None for prepass hits
 print(result["mse"])             # ~6e-32
 ```
 
+Two-variable matrix input works too:
+
+```python
+from eml import regress
+import numpy as np
+
+x0, x1 = np.meshgrid(np.linspace(0.1, 2.0, 8), np.linspace(0.5, 2.5, 6))
+X = np.column_stack([x0.ravel(), x1.ravel()])
+y = X[:, 0] + X[:, 1]
+
+result = regress(X, y)
+
+print(result["expression"])     # x0 + x1
+print(result["feature_names"])  # ['x0', 'x1']
+print(result["used_features"])  # ['x0', 'x1']
+```
+
+Custom feature names are supported:
+
+```python
+result = regress(X, y, feature_names=["length", "time"])
+print(result["expression"])  # length + time
+```
+
 Result fields:
 
 - `expression`: simplified symbolic expression to show the model or user
 - `strategy`: `"prepass"` for closed-form hits, `"eml_tree"` for actual EML-tree discoveries
 - `depth`: EML tree depth only; `0` means the pre-pass solved it before tree search
-- `eml_expression`: raw EML tree string, or `null`/`None` when the pre-pass found the answer
+- `eml_expression`: raw EML tree string, or `None` when the pre-pass found the answer
 - `mse`, `constants`, `leaf_types`: fit quality and low-level search details
+- `feature_names`, `used_features`: resolved input names and which features appear in the final formula
 
 ### CLI
 
@@ -115,17 +150,23 @@ eml-regress --func "sin(x)" --range 0.1 5 --seed 123
 # From JSON data
 echo '{"x": [1,2,3,4], "y": [2.72,7.39,20.09,54.60]}' | eml-regress
 
+# From 2-feature JSON data
+echo '{"x": [[0.1,0.5],[0.2,0.5],[0.1,0.7],[0.2,0.7]], "y": [0.6,0.7,0.8,0.9]}' | eml-regress
+
+# With custom feature names
+echo '{"x": [[0.1,0.5],[0.2,0.5],[0.1,0.7],[0.2,0.7]], "y": [0.6,0.7,0.8,0.9], "feature_names": ["a","b"]}' | eml-regress
+
 # JSON output for automation
 echo '{"x": [...], "y": [...]}' | eml-regress --output-json
-
-# Output includes: expression, eml_expression, depth, strategy, mse, constants, leaf_types
 ```
+
+JSON output includes `expression`, `eml_expression`, `depth`, `strategy`, `mse`, `constants`, `leaf_types`, `feature_names`, and `used_features`.
 
 ---
 
-## Hermes Agent Integration
+## Hermes Integration
 
-This tool was designed to give **small local LLMs** mathematical capabilities they can't have natively. A 7B Hermes model that can call this tool outperforms a 70B model doing math from memory.
+This tool was designed to give small local LLMs mathematical capabilities they cannot have natively. A 7B Hermes model that can call this tool can outperform a much larger model trying to do the math from memory.
 
 ### The pattern
 
@@ -141,113 +182,101 @@ User: "What formula fits this data?"
     Reports: "The data follows y = e^x"
 ```
 
-**The model orchestrates. The tool does the math.**
+The model orchestrates. The tool does the math.
 
-### Three integration paths
+### Two integration paths
 
-Pick the one that fits your setup:
-
-#### Option A -- Native tool (tightest integration)
+#### Option A -- Native tool
 
 Three steps:
 
 1. Copy `hermes/hermes_tool.py` into `hermes-agent/tools/eml_tool.py`
+2. Register the import in `tools/model_tools.py` by adding `"tools.eml_tool"` to `_discover_tools()`
+3. Add `"eml_symbolic_regression"` to the relevant Hermes toolset in `tools/toolsets.py`
 
-2. Register the import in `tools/model_tools.py` -- add to the `_modules` list in `_discover_tools()`:
-   ```python
-   "tools.eml_tool",
-   ```
+The handler calls `from eml import regress` directly and uses the Hermes registry helpers.
 
-3. Make the tool visible to the LLM -- in `tools/toolsets.py`, add `"eml_symbolic_regression"` to `_HERMES_CORE_TOOLS`.
-
-```python
-# The tool auto-registers with the Hermes ToolRegistry at import:
-#   name:     "eml_symbolic_regression"
-#   toolset:  "math"
-#   handler:  Python callable (no subprocess, no shell)
-#   check_fn: validates eml package is installed
-```
-
-The handler calls `from eml import regress` directly and uses `tool_error()` / `tool_result()` from the Hermes registry helpers.
-
-Native Hermes and MCP responses include:
+Native Hermes responses include:
 
 - `expression`: best symbolic form to show the user
 - `quality`: `exact`, `approximate`, or `rough`
 - `strategy`: `prepass` or `eml_tree`
 - `depth`: EML depth only; `0` means the hybrid pre-pass solved it
-- `mse`, `constants`, `eml_expression`
+- `mse`, `constants`, `eml_expression`, `feature_names`, `used_features`
 
-Python and CLI calls also expose `seed` for deterministic search. The current Hermes native / MCP wrappers expose `x`, `y`, and `max_depth`.
+Python and CLI calls also expose `seed` for deterministic search. The Hermes native wrapper exposes `x`, `y`, optional `feature_names`, and `max_depth`, where `x` can be a 1D array or a 2D matrix.
 
-#### Option B -- MCP server (no code changes to Hermes)
+#### Option B -- Skill only
 
-Uses the official MCP Python SDK (`FastMCP`) so the framing/protocol always matches what hermes-agent expects. Requires: `pip install mcp`
-
-Add to `~/.hermes/config.yaml`:
-
-```yaml
-mcp_servers:
-  eml:
-    command: python
-    args: ["/path/to/eml-symbolic-regression/hermes/mcp_server.py"]
-    timeout: 120
-```
-
-Hermes auto-discovers the tool as `mcp_eml_eml_symbolic_regression` via the MCP stdio protocol. No changes to the Hermes codebase needed.
-
-#### Option C -- Skill only (prompt-based guidance)
-
-Copy the `hermes/skill/` directory into `hermes-agent/skills/math/eml-symbolic-regression/`. The SKILL.md uses the correct Hermes frontmatter format (`metadata.hermes.tags`, `metadata.hermes.requires_tools`) so it integrates with skill discovery and search. Teaches Hermes *when* and *how* to use the tool, including fallback strategies when results are approximate.
+Copy the `hermes/skill/` directory into `hermes-agent/skills/math/eml-symbolic-regression/`. The SKILL file teaches Hermes when and how to use the tool, including fallback guidance when results are approximate.
 
 ### What the LLM needs to do
 
 Almost nothing. It just needs to:
+
 1. Recognise "find the formula" type questions
 2. Put the numbers into `x` and `y` arrays
 3. Call the tool
 4. Report the result
 
-No chain-of-thought math. No symbolic manipulation. No arithmetic. The transformer does what it's good at (language), the tool does what it's good at (math).
+No chain-of-thought math. No symbolic manipulation. No arithmetic. The transformer does what it is good at (language), the tool does what it is good at (math).
 
 ### Works with any OpenAI-compatible framework
 
-The tool schema in `hermes/tool_schema.json` is standard OpenAI function-calling format. If you're using vLLM, Ollama, or raw llama.cpp instead of hermes-agent, the stdin/stdout CLI mode still works:
+The schema in `hermes/tool_schema.json` uses standard OpenAI function-calling format. If you are using vLLM, Ollama, or raw llama.cpp instead of hermes-agent, stdin/stdout CLI mode still works:
 
 ```bash
 echo '{"x": [1,2,3,4], "y": [2.72,7.39,20.09,54.60]}' | python -m eml.engine
 ```
 
-On Windows, multiprocessing works best from a normal script or agent process. For ad-hoc REPL / `python -` experiments, prefer the CLI path above or force single-process Python calls with `workers=1`.
+On Windows, multiprocessing works best from a normal script or agent process. For ad-hoc REPL or `python -` experiments, prefer the CLI path above or force single-process Python calls with `workers=1`.
 
 ---
 
 ## Benchmarks
 
-Tested on common functions, 200 data points, `x in [0.1, 4.0]`:
+Benchmark scripts:
+
+- `python examples/benchmark.py`
+- `python examples/benchmark_multivariable.py`
+
+Single-variable benchmark on common functions, 200 data points, `x in [0.1, 4.0]`:
 
 | Target | Discovered | MSE | Depth | Time | Status |
 |--------|-----------|-----|-------|------|--------|
-| `exp(x)` | `exp(x)` | ~0 | 0 | 0.1s | **EXACT** |
-| `1/x` | `1/x` | ~0 | 0 | 0.0s | **EXACT** |
-| `ln(x)` | `log(x)` | ~0 | 0 | 0.1s | **EXACT** |
-| `exp(-x)` | `exp(-x)` | ~0 | 0 | 0.1s | **EXACT** |
-| `x + 1` | `x + 1` | ~0 | 0 | 0.0s | **EXACT** |
-| `x^2` | `x**2` | ~0 | 0 | 0.0s | **EXACT** |
-| `sqrt(x)` | `sqrt(x)` | ~0 | 0 | 0.1s | **EXACT** |
-| `sin(x)` | approx | 1.9e-2 | 3 | 32.5s | Approx |
+| `exp(x)` | `exp(x)` | ~0 | 0 | 0.1s | EXACT |
+| `1/x` | `1/x` | ~0 | 0 | 0.0s | EXACT |
+| `ln(x)` | `log(x)` | ~0 | 0 | 0.1s | EXACT |
+| `exp(-x)` | `exp(-x)` | ~0 | 0 | 0.1s | EXACT |
+| `x + 1` | `x + 1` | ~0 | 0 | 0.0s | EXACT |
+| `x^2` | `x**2` | ~0 | 0 | 0.0s | EXACT |
+| `sqrt(x)` | `sqrt(x)` | ~0 | 0 | 0.1s | EXACT |
+| `sin(x)` | approx | `1.1e-2` | 3 | 32.0s | Approx |
 
-`Depth = 0` means the hybrid pre-pass found an exact closed form before any EML tree search ran. It does **not** mean there is a zero-leaf EML tree.
+`Depth = 0` means the hybrid pre-pass found an exact closed form before any EML tree search ran. It does not mean there is a zero-leaf EML tree.
+
+Two-variable benchmark on a small `(x0, x1)` grid:
+
+| Target | Discovered | MSE | Strategy | Depth | Time |
+|--------|-----------|-----|----------|-------|------|
+| `x0 + x1` | `x0 + x1` | ~0 | prepass | 0 | 0.1s |
+| `x0 * x1` | `x0*x1` | ~0 | prepass | 0 | 0.1s |
+| `x0 / x1` | `x0/x1` | ~0 | prepass | 0 | 0.1s |
+| `exp(x0 + x1)` | `exp(x0 + x1)` | ~0 | prepass | 0 | 0.1s |
+| `x0^2 + x1` | `x0**2 + x1` | ~0 | prepass | 0 | 0.1s |
+| `eml(x0, x1)` | `exp(x0) - log(x1)` | 0 | eml_tree | 1 | 0.2s |
 
 ### Sweet spot
 
-Common exponentials, logarithms, power laws, and low-degree polynomials are found **exactly** and usually return before the EML tree search even starts. This covers exponential growth/decay, reciprocal relationships, roots, and standard algebraic forms.
+Common exponentials, logarithms, power laws, low-degree polynomials, and several basic 2D forms are found exactly and usually return before the EML tree search even starts. This covers exponential growth/decay, reciprocal relationships, roots, affine 2D forms, simple products and ratios, and standard algebraic forms.
 
 ### Honest limitations
 
-- **Oscillatory / trig functions** (`sin`, `cos`) still need deeper trees (depth 4+) for exact recovery
-- **Single variable** only -- no `f(x, y)` yet
-- **Clean data preferred** -- the optimizer can overfit to noise
+- Oscillatory / trig functions (`sin`, `cos`) still need deeper trees (depth 4+) for exact recovery
+- Up to 2 variables in the current tree search -- deeper multivariable scaling still needs guided search
+- Clean data preferred -- the optimiser can overfit noise
+- Sparse or narrow-range data can be misleading -- a low-error polynomial surrogate may beat the intended closed form on small samples
+- Hermes `quality` is heuristic -- it is based on MSE thresholds, not a proof that the recovered expression is the unique underlying law
 
 ---
 
@@ -255,8 +284,9 @@ Common exponentials, logarithms, power laws, and low-degree polynomials are foun
 
 ### The grammar
 
-Every expression is a **full binary tree** where:
-- Leaves are: `x`, `0`, `1`, or `c` (trainable constant)
+Every expression is a full binary tree where:
+
+- Leaves are feature names (`x`, `x0`, `x1`, ...), `0`, `1`, or `c` (trainable constant)
 - Internal nodes are all `eml(left, right)`
 
 ```
@@ -271,7 +301,7 @@ Every expression is a **full binary tree** where:
      eml   eml
     / \    / \
    c   x  0   1         eml(eml(c,x), eml(0,1)) = exp(exp(c)-ln(x)) - ln(1)
-                                                  ≈ 1/x  (when c → -inf)
+                                                  ~= 1/x  (when c -> -inf)
 ```
 
 ### The search
@@ -279,8 +309,9 @@ Every expression is a **full binary tree** where:
 ```
 Phase 0  Hybrid exact-form pre-pass
          Try cheap closed-form fits before touching the EML tree search.
-         Polynomial (deg 1-4), power law, exponential, logarithmic.
-         Solves x + 1, x^2, sqrt(x), 1/x, exp(x), ln(x) in milliseconds.
+         1D: polynomial (deg 1-4), power law, exponential, logarithmic.
+         2D: affine, bilinear, quadratic, power-law, exponential, and log-linear fits.
+         Solves x + 1, x^2, sqrt(x), 1/x, exp(x), ln(x), x0 + x1, x0*x1 in milliseconds.
 ```
 
 ```
@@ -298,19 +329,20 @@ Phase 2  Parallel screening
 
 Phase 3  Full refinement
          Top 30 candidates get full optimisation.
-         3 restarts with broader initialisation scales.
+         Broader initialisation scales.
          Polishes the best discoveries.
 ```
 
 ### Why not traditional symbolic regression?
 
-Traditional SR (PySR, gplearn, etc.) searches over a large ad-hoc grammar: `+, -, *, /, sin, cos, exp, log, pow, sqrt, ...`. The search space is irregular and the grammar choice is arbitrary.
+Traditional symbolic regression systems (PySR, gplearn, etc.) search over a large ad-hoc grammar: `+, -, *, /, sin, cos, exp, log, pow, sqrt, ...`. The search space is irregular and the grammar choice is arbitrary.
 
-EML has **one operator**. The search space is a set of binary trees with uniform structure. This means:
+EML has one operator. The search space is a set of binary trees with uniform structure. This means:
+
 - Exhaustive search is feasible at depth 1-3
-- The grammar is **provably complete** (not heuristic)
-- Constants are optimised with standard methods (Nelder-Mead)
-- Results can be made reproducible with `seed=` / `--seed`
+- The grammar is provably complete, not heuristic
+- Constants are optimised with standard methods such as Nelder-Mead
+- Results can be made reproducible with `seed=` or `--seed`
 
 ---
 
@@ -319,24 +351,24 @@ EML has **one operator**. The search space is a set of binary trees with uniform
 ```
 eml-symbolic-regression/
   eml/
-    __init__.py              Clean API: from eml import regress
-    engine.py                Hybrid pre-pass + EML search engine
+    __init__.py                 Clean API: from eml import regress
+    engine.py                   Hybrid pre-pass + EML search engine
   hermes/
-    hermes_tool.py           Native Hermes tool module (returns quality + strategy)
-    mcp_server.py            MCP stdio server (configure in config.yaml)
-    tool_schema.json         OpenAI function-calling schema (inner format)
-    system_prompt_snippet.md System prompt addition for tool guidance
+    hermes_tool.py              Native Hermes tool module
+    tool_schema.json            OpenAI function-calling schema
+    system_prompt_snippet.md    System prompt guidance
     skill/
-      SKILL.md               Hermes skill definition (prompt-based)
+      SKILL.md                  Hermes skill definition
   examples/
-    quickstart.py            3-line usage
-    from_data_points.py      Realistic scenario (RC circuit decay)
-    benchmark.py             Performance table generator
-    cli_examples.sh          CLI usage patterns
+    quickstart.py               3-line usage
+    from_data_points.py         Noisy measurement example
+    benchmark.py                Single-variable benchmark generator
+    benchmark_multivariable.py  Two-feature benchmark generator
+    cli_examples.sh             CLI usage patterns
   tests/
-    test_engine.py           Regression + symbolic/numeric consistency checks
-  pyproject.toml             pip installable
-  LICENSE                    MIT
+    test_engine.py              Regression + symbolic/numeric consistency checks
+  pyproject.toml                pip-installable project metadata
+  LICENSE                       MIT
 ```
 
 ---
@@ -344,9 +376,9 @@ eml-symbolic-regression/
 ## Reference
 
 ```bibtex
-@article{odrzywołek2026eml,
+@article{odrzywolek2026eml,
   title   = {All elementary functions from a single binary operator},
-  author  = {Odrzywołek, Andrzej},
+  author  = {Odrzywolek, Andrzej},
   journal = {arXiv preprint arXiv:2603.21852},
   year    = {2026}
 }

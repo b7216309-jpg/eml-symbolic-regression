@@ -24,17 +24,20 @@ __version__ = "0.1.0"
 __all__ = ["regress", "symbolic_regression", "evaluate_tree", "eml_np"]
 
 
-def regress(x, y, max_depth=3, tolerance=1e-8, verbose=False, workers=None, seed=None):
+def regress(x, y, max_depth=3, tolerance=1e-8, verbose=False, workers=None,
+            seed=None, feature_names=None):
     """Discover the formula behind your data.
 
     Args:
-        x: Input values (array-like, 1D).
+        x: Input values (array-like, 1D) or feature matrix (array-like, 2D).
         y: Output values (array-like, same length as x).
         max_depth: Maximum EML tree depth (1-4). Default 3.
         tolerance: Stop early if MSE drops below this. Default 1e-8.
         verbose: Print search progress. Default False.
         workers: Number of parallel workers. Default auto.
         seed: Optional RNG seed for deterministic search.
+        feature_names: Optional names for 2D feature inputs. Defaults to
+            `x0`, `x1`, ... for matrices, while legacy 1D vectors still use `x`.
 
     Returns:
         Result dict with keys:
@@ -44,6 +47,8 @@ def regress(x, y, max_depth=3, tolerance=1e-8, verbose=False, workers=None, seed
             depth          - Tree depth used
             constants      - Optimised constant values
             leaf_types     - Leaf configuration of best tree
+            feature_names  - Resolved feature names used by the engine
+            used_features  - Which input features appear in the final formula
     """
     return symbolic_regression(
         x, y,
@@ -52,5 +57,6 @@ def regress(x, y, max_depth=3, tolerance=1e-8, verbose=False, workers=None, seed
         verbose=verbose,
         workers=workers,
         seed=seed,
+        feature_names=feature_names,
         max_random=10000,
     )

@@ -13,29 +13,31 @@ The EML operator:  eml(a, b) = exp(a) - ln(b)
 Grammar:           S -> x | 0 | 1 | c | eml(S, S)
 """
 
+import argparse
+from concurrent.futures import ProcessPoolExecutor
+from itertools import product
+import json
+import os
+import sys
+import time
+import warnings
+
 import numpy as np
 from scipy.optimize import basinhopping, minimize
-from itertools import product
-from concurrent.futures import ProcessPoolExecutor
 import sympy as sp
-import json
-import sys
-import os
-import argparse
-import warnings
-import time
 
 warnings.filterwarnings("ignore")
 
 
 # ── Leaf alphabet ───────────────────────────────────────────────────
 
-X    = "x"   # input variable
-ONE  = "1"   # constant 1
+X = "x"      # input variable for legacy 1D vector calls
+ONE = "1"    # constant 1
 ZERO = "0"   # constant 0
-C    = "c"   # trainable constant (fitted to data)
+C = "c"      # trainable constant (fitted to data)
 
 LEAF_OPTIONS = [X, ONE, ZERO, C]
+MAX_SEARCH_FEATURES = 2
 EXHAUSTIVE_LIMIT = 20000
 MIN_VALID_FRACTION = 0.9
 SAMPLE_BUCKET_WEIGHTS = {
@@ -62,13 +64,85 @@ def eml_np(a, b):
         return np.exp(np.clip(a, -50, 50)) - np.log(np.maximum(np.abs(b), 1e-300))
 
 
-def _x_symbol_for_data(x_data):
-    """Pick the strongest safe assumption for x based on the observed domain."""
-    if len(x_data) and np.all(x_data > 0):
-        return sp.Symbol("x", positive=True, real=True)
-    if len(x_data) and np.all(x_data < 0):
-        return sp.Symbol("x", negative=True, real=True)
-    return sp.Symbol("x", real=True)
+def _is_feature_token(token):
+    """Return True when the token denotes an input feature leaf."""
+    return isinstance(token, str) and token not in {ONE, ZERO, C}
+
+
+def _contains_feature(cfg):
+    """Require each candidate tree to depend on at least one input feature."""
+    return any(_is_feature_token(token) for token in cfg)
+
+
+def _validate_feature_names(feature_names, n_features):
+    """Validate user-supplied feature names."""
+    if len(feature_names) != n_features:
+        raise ValueError(
+            f"feature_names length ({len(feature_names)}) must match input width ({n_features})"
+        )
+    seen = set()
+    for name in feature_names:
+        if not isinstance(name, str) or not name.strip():
+            raise ValueError("feature_names must contain non-empty strings")
+        if name in {ONE, ZERO, C}:
+            raise ValueError(f"feature name '{name}' is reserved")
+        if name in seen:
+            raise ValueError("feature_names must be unique")
+        seen.add(name)
+    return [str(name) for name in feature_names]
+
+
+def _default_feature_names(n_features, preserve_scalar_name):
+    """Pick default feature names for 1D vectors vs. explicit matrices."""
+    if n_features == 1 and preserve_scalar_name:
+        return [X]
+    return [f"x{i}" for i in range(n_features)]
+
+
+def _coerce_feature_matrix(x_data, feature_names=None, *, preserve_scalar_name=True):
+    """Normalise vector/matrix inputs into a feature matrix plus names."""
+    x_arr = np.asarray(x_data, dtype=np.float64)
+    if x_arr.ndim == 1:
+        x_arr = x_arr.reshape(-1, 1)
+        default_names = _default_feature_names(1, preserve_scalar_name)
+    elif x_arr.ndim == 2:
+        default_names = _default_feature_names(x_arr.shape[1], preserve_scalar_name=False)
+    else:
+        raise ValueError("x_data must be a 1D array or 2D feature matrix")
+
+    if x_arr.shape[0] == 0 or x_arr.shape[1] == 0:
+        raise ValueError("x_data must be non-empty")
+    if not np.all(np.isfinite(x_arr)):
+        raise ValueError("x_data must contain only finite values")
+
+    if feature_names is None:
+        feature_names = default_names
+    else:
+        feature_names = _validate_feature_names(list(feature_names), x_arr.shape[1])
+    return x_arr, list(feature_names)
+
+
+def _symbol_for_feature(name, values):
+    """Pick the strongest safe assumption for one feature based on its domain."""
+    if len(values) and np.all(values > 0):
+        return sp.Symbol(name, positive=True, real=True)
+    if len(values) and np.all(values < 0):
+        return sp.Symbol(name, negative=True, real=True)
+    return sp.Symbol(name, real=True)
+
+
+def _feature_symbol_map(x_data, feature_names):
+    """Create a stable feature-name -> sympy symbol map."""
+    return {
+        name: _symbol_for_feature(name, x_data[:, idx])
+        for idx, name in enumerate(feature_names)
+    }
+
+
+def _used_features_from_leaf_types(leaf_types, feature_names):
+    """Preserve feature order in result metadata."""
+    present = set(token for token in leaf_types if _is_feature_token(token))
+    return [name for name in feature_names if name in present]
 
 
 def _score_prediction(pred, y_data, min_valid_fraction=MIN_VALID_FRACTION):
@@ -83,7 +157,8 @@ def _score_prediction(pred, y_data, min_valid_fraction=MIN_VALID_FRACTION):
 
 
 def _build_result(expression, mse, depth, leaf_types=None, constants=None,
-                  eml_expression=None, strategy=None):
+                  eml_expression=None, strategy=None, feature_names=None,
+                  used_features=None):
     """Normalise result payloads across search and pre-pass paths."""
     return {
         "expression": str(expression) if expression is not None else None,
@@ -93,6 +168,8 @@ def _build_result(expression, mse, depth, leaf_types=None, constants=None,
         "constants": list(constants or []),
         "leaf_types": list(leaf_types) if leaf_types else [],
         "strategy": strategy,
+        "feature_names": list(feature_names or []),
+        "used_features": list(used_features or []),
     }
 
 
@@ -122,18 +199,18 @@ def _should_prune_config(cfg):
     """Skip trees with constant-only substructures that collapse to simpler forms."""
     for i in range(0, len(cfg), 2):
         pair = cfg[i:i + 2]
-        if X not in pair and pair.count(C) > 1:
+        if not _contains_feature(pair) and pair.count(C) > 1:
             return True
 
     if len(cfg) >= 4:
         for i in range(0, len(cfg), 4):
             group = cfg[i:i + 4]
-            if X not in group and C in group:
+            if not _contains_feature(group) and C in group:
                 return True
     return False
 
 
-def _sample_one_config(n_leaves, constant_count, rng):
+def _sample_one_config(n_leaves, constant_count, rng, feature_names):
     """Sample one leaf configuration with a target constant count."""
     if n_leaves < 1:
         raise ValueError("n_leaves must be positive")
@@ -148,18 +225,18 @@ def _sample_one_config(n_leaves, constant_count, rng):
             cfg[int(idx)] = C
 
     non_const_positions = [i for i, value in enumerate(cfg) if value is None]
-    x_position = int(rng.choice(non_const_positions))
-    cfg[x_position] = X
+    feature_position = int(rng.choice(non_const_positions))
+    cfg[feature_position] = str(rng.choice(feature_names))
 
-    remaining = [i for i in non_const_positions if i != x_position]
+    remaining = [i for i in non_const_positions if i != feature_position]
     if remaining:
-        choices = rng.choice([X, ONE, ZERO], size=len(remaining), replace=True)
+        choices = rng.choice(list(feature_names) + [ONE, ZERO], size=len(remaining), replace=True)
         for idx, choice in zip(remaining, choices):
             cfg[idx] = str(choice)
     return tuple(cfg)
 
 
-def _sample_configs(n_leaves, max_random, rng):
+def _sample_configs(n_leaves, max_random, rng, feature_names):
     """Stratified random sampling biased toward 1-2 constant trees."""
     if max_random <= 0:
         return []
@@ -191,14 +268,14 @@ def _sample_configs(n_leaves, max_random, rng):
                 constant_count = int(rng.integers(4, max(5, n_leaves)))
             else:
                 constant_count = bucket
-            cfg = _sample_one_config(n_leaves, constant_count, rng)
+            cfg = _sample_one_config(n_leaves, constant_count, rng, feature_names)
             if cfg not in sampled:
                 sampled[cfg] = None
                 bucket_counts[min(cfg.count(C), 4)] += 1
 
     while len(sampled) < max_random:
         constant_count = int(rng.integers(0, max(1, n_leaves)))
-        cfg = _sample_one_config(n_leaves, constant_count, rng)
+        cfg = _sample_one_config(n_leaves, constant_count, rng, feature_names)
         if cfg not in sampled:
             sampled[cfg] = None
             bucket_counts[min(cfg.count(C), 4)] += 1
@@ -215,19 +292,31 @@ def _init_screen_worker(x_data, y_data):
 
 # ── Tree evaluation ─────────────────────────────────────────────────
 
-def evaluate_tree(leaf_types, x_data, constants=None):
+def evaluate_tree(leaf_types, x_data, constants=None, feature_names=None):
     """Evaluate a full binary EML tree bottom-up. Pure numpy."""
+    x_matrix, resolved_names = _coerce_feature_matrix(
+        x_data,
+        feature_names=feature_names,
+        preserve_scalar_name=True,
+    )
+    feature_lookup = {
+        name: x_matrix[:, idx]
+        for idx, name in enumerate(resolved_names)
+    }
+    n_samples = x_matrix.shape[0]
     c_idx = 0
     leaves = []
     for lt in leaf_types:
-        if lt == X:
-            leaves.append(x_data)
+        if _is_feature_token(lt):
+            if lt not in feature_lookup:
+                raise ValueError(f"Unknown feature leaf '{lt}' for feature names {resolved_names}")
+            leaves.append(feature_lookup[lt])
         elif lt == ONE:
-            leaves.append(np.ones_like(x_data))
+            leaves.append(np.ones(n_samples, dtype=np.float64))
         elif lt == ZERO:
-            leaves.append(np.zeros_like(x_data))
+            leaves.append(np.zeros(n_samples, dtype=np.float64))
         else:  # C
-            leaves.append(np.full_like(x_data, float(constants[c_idx])))
+            leaves.append(np.full(n_samples, float(constants[c_idx]), dtype=np.float64))
             c_idx += 1
 
     cur = leaves
@@ -242,13 +331,14 @@ def evaluate_tree(leaf_types, x_data, constants=None):
 # ── Constant optimisation ──────────────────────────────────────────
 
 def optimize_constants(leaf_types, x_data, y_data, n_constants,
-                       restarts=3, quick=False, rng=None, use_basinhopping=None):
+                       restarts=3, quick=False, rng=None, use_basinhopping=None,
+                       feature_names=None):
     """Fit trainable constants via Nelder-Mead.
 
     ~7ms per call (quick), ~15ms (full). Near-instant for 1-4 params.
     """
     if n_constants <= 0:
-        pred = evaluate_tree(leaf_types, x_data, [])
+        pred = evaluate_tree(leaf_types, x_data, [], feature_names=feature_names)
         return _score_prediction(pred, y_data), []
 
     if rng is None:
@@ -271,7 +361,7 @@ def optimize_constants(leaf_types, x_data, y_data, n_constants,
     }
 
     def objective(c):
-        pred = evaluate_tree(leaf_types, x_data, c)
+        pred = evaluate_tree(leaf_types, x_data, c, feature_names=feature_names)
         mse = _score_prediction(pred, y_data)
         return mse if np.isfinite(mse) else 1e20
 
@@ -350,16 +440,59 @@ def _nice(val, tol=1e-5):
     return sp.Float(val, 4)
 
 
-def _fit_standard_forms(x_data, y_data, tolerance):
+def _maybe_prepass_result(pred, expr, y_data, tolerance, feature_names, used_features):
+    """Wrap an exact or near-exact pre-pass fit into the standard result shape."""
+    mse = _score_prediction(pred, y_data, min_valid_fraction=1.0)
+    if mse < tolerance:
+        try:
+            expr = sp.simplify(expr)
+        except Exception:
+            pass
+        return _build_result(
+            expr,
+            mse,
+            depth=0,
+            strategy="prepass",
+            feature_names=feature_names,
+            used_features=used_features,
+        )
+    return None
+
+
+def _fit_linear_basis(basis_terms, y_data, tolerance, feature_names, nice_tol):
+    """Fit a linear combination of fixed basis functions with least squares."""
+    if not basis_terms:
+        return None
+    design = np.column_stack([column for column, _, _ in basis_terms])
+    if not np.all(np.isfinite(design)):
+        return None
+
+    coeffs, *_ = np.linalg.lstsq(design, y_data, rcond=None)
+    pred = design @ coeffs
+    expr = sp.Integer(0)
+    used = set()
+    for coeff, (_, term_expr, term_used) in zip(coeffs, basis_terms):
+        if abs(coeff) < nice_tol:
+            continue
+        expr += _nice(float(coeff), tol=nice_tol) * term_expr
+        used.update(term_used)
+    return _maybe_prepass_result(
+        pred,
+        sp.expand(expr),
+        y_data,
+        tolerance,
+        feature_names,
+        [name for name in feature_names if name in used],
+    )
+
+
+def _fit_standard_forms_1d(x_data, y_data, tolerance, x_sym, feature_name, feature_names):
     """Cheap exact-fit pre-pass for common one-variable function families."""
-    x_sym = _x_symbol_for_data(x_data)
     nice_tol = max(tolerance, 1e-5)
 
     def _maybe_result(pred, expr):
-        mse = _score_prediction(pred, y_data, min_valid_fraction=1.0)
-        if mse < tolerance:
-            return _build_result(sp.simplify(expr), mse, depth=0, strategy="prepass")
-        return None
+        used = [feature_name] if x_sym in getattr(expr, "free_symbols", set()) else []
+        return _maybe_prepass_result(pred, expr, y_data, tolerance, feature_names, used)
 
     for degree in range(1, 5):
         if len(x_data) < degree + 1:
@@ -400,17 +533,120 @@ def _fit_standard_forms(x_data, y_data, tolerance):
         result = _maybe_result(pred, expr)
         if result is not None:
             return result
+
     return None
 
 
-def tree_to_sympy(leaf_types, constants=None, x_symbol=None):
+def _fit_standard_forms(x_data, y_data, tolerance, feature_names, feature_symbols):
+    """Hybrid pre-pass for exact common forms before EML tree search."""
+    if x_data.shape[1] == 1:
+        name = feature_names[0]
+        return _fit_standard_forms_1d(
+            x_data[:, 0],
+            y_data,
+            tolerance,
+            feature_symbols[name],
+            name,
+            feature_names,
+        )
+
+    for idx, name in enumerate(feature_names):
+        result = _fit_standard_forms_1d(
+            x_data[:, idx],
+            y_data,
+            tolerance,
+            feature_symbols[name],
+            name,
+            feature_names,
+        )
+        if result is not None:
+            return result
+
+    x0 = x_data[:, 0]
+    x1 = x_data[:, 1]
+    name0, name1 = feature_names
+    sym0 = feature_symbols[name0]
+    sym1 = feature_symbols[name1]
+    ones = np.ones(len(y_data), dtype=np.float64)
+    nice_tol = max(tolerance, 1e-5)
+
+    linear_families = [
+        [
+            (ones, sp.Integer(1), []),
+            (x0, sym0, [name0]),
+            (x1, sym1, [name1]),
+        ],
+        [
+            (ones, sp.Integer(1), []),
+            (x0, sym0, [name0]),
+            (x1, sym1, [name1]),
+            (x0 * x1, sym0 * sym1, [name0, name1]),
+        ],
+        [
+            (ones, sp.Integer(1), []),
+            (x0, sym0, [name0]),
+            (x1, sym1, [name1]),
+            (x0 * x1, sym0 * sym1, [name0, name1]),
+            (x0 ** 2, sym0 ** 2, [name0]),
+            (x1 ** 2, sym1 ** 2, [name1]),
+        ],
+    ]
+    for basis_terms in linear_families:
+        result = _fit_linear_basis(basis_terms, y_data, tolerance, feature_names, nice_tol)
+        if result is not None:
+            return result
+
+    if np.all(y_data > 0):
+        design = np.column_stack([ones, x0, x1])
+        coeffs, *_ = np.linalg.lstsq(design, np.log(y_data), rcond=None)
+        scale = float(np.exp(coeffs[0]))
+        pred = scale * np.exp(coeffs[1] * x0 + coeffs[2] * x1)
+        expr = _nice(scale, tol=nice_tol) * sp.exp(
+            _nice(float(coeffs[1]), tol=nice_tol) * sym0
+            + _nice(float(coeffs[2]), tol=nice_tol) * sym1
+        )
+        result = _maybe_prepass_result(pred, expr, y_data, tolerance, feature_names, feature_names)
+        if result is not None:
+            return result
+
+    if np.all(x0 > 0) and np.all(x1 > 0) and np.all(y_data > 0):
+        design = np.column_stack([ones, np.log(x0), np.log(x1)])
+        coeffs, *_ = np.linalg.lstsq(design, np.log(y_data), rcond=None)
+        scale = float(np.exp(coeffs[0]))
+        pred = scale * np.power(x0, coeffs[1]) * np.power(x1, coeffs[2])
+        expr = (
+            _nice(scale, tol=nice_tol)
+            * sym0 ** _nice(float(coeffs[1]), tol=nice_tol)
+            * sym1 ** _nice(float(coeffs[2]), tol=nice_tol)
+        )
+        result = _maybe_prepass_result(pred, expr, y_data, tolerance, feature_names, feature_names)
+        if result is not None:
+            return result
+
+        coeffs, *_ = np.linalg.lstsq(design, y_data, rcond=None)
+        pred = coeffs[0] + coeffs[1] * np.log(x0) + coeffs[2] * np.log(x1)
+        expr = (
+            _nice(float(coeffs[0]), tol=nice_tol)
+            + _nice(float(coeffs[1]), tol=nice_tol) * sp.log(sym0)
+            + _nice(float(coeffs[2]), tol=nice_tol) * sp.log(sym1)
+        )
+        result = _maybe_prepass_result(pred, expr, y_data, tolerance, feature_names, feature_names)
+        if result is not None:
+            return result
+
+    return None
+
+
+def tree_to_sympy(leaf_types, constants=None, x_symbol=None, feature_symbols=None):
     """Convert an EML tree to a simplified sympy expression."""
-    x_sym = x_symbol if x_symbol is not None else sp.Symbol("x", real=True)
+    feature_symbols = dict(feature_symbols or {})
+    if x_symbol is not None:
+        feature_symbols.setdefault(X, x_symbol)
     c_idx = 0
     leaves = []
     for lt in leaf_types:
-        if lt == X:
-            leaves.append(x_sym)
+        if _is_feature_token(lt):
+            leaves.append(feature_symbols.get(lt, sp.Symbol(lt, real=True)))
         elif lt == ZERO:
             leaves.append(sp.Integer(0))
         elif lt == ONE:
@@ -447,8 +683,8 @@ def _eml_str(leaf_types, constants=None):
     c_idx = 0
     strs = []
     for lt in leaf_types:
-        if lt == X:
-            strs.append("x")
+        if _is_feature_token(lt):
+            strs.append(str(lt))
         elif lt == ONE:
             strs.append("1")
         elif lt == ZERO:
@@ -469,11 +705,11 @@ def _eml_str(leaf_types, constants=None):
 
 def _screen_one(args):
     """Worker for parallel Phase 2 screening."""
-    if len(args) == 3:
-        lt, nc, seed = args
+    if len(args) == 4:
+        lt, nc, seed, feature_names = args
         x_data, y_data = _WORKER_X_DATA, _WORKER_Y_DATA
     else:
-        lt, x_data, y_data, nc, seed = args
+        lt, x_data, y_data, nc, seed, feature_names = args
     mse, consts = optimize_constants(
         lt,
         x_data,
@@ -481,12 +717,14 @@ def _screen_one(args):
         nc,
         quick=True,
         rng=np.random.default_rng(seed),
+        feature_names=feature_names,
     )
     return mse, lt, nc, consts
 
 
 def symbolic_regression(x_data, y_data, max_depth=3, tolerance=1e-8,
-                        verbose=True, max_random=10000, workers=None, seed=None):
+                        verbose=True, max_random=10000, workers=None, seed=None,
+                        feature_names=None):
     """Search for the simplest EML tree that fits the data.
 
     A cheap exact-form pre-pass runs before the EML search. If that misses,
@@ -496,7 +734,7 @@ def symbolic_regression(x_data, y_data, max_depth=3, tolerance=1e-8,
       3) Full optimisation of top candidates
 
     Args:
-        x_data:     Input array.
+        x_data:     Input vector or feature matrix.
         y_data:     Target array.
         max_depth:  Max tree depth (1-4). 3 recommended.
         tolerance:  Early-stop MSE threshold.
@@ -508,30 +746,46 @@ def symbolic_regression(x_data, y_data, max_depth=3, tolerance=1e-8,
     Returns:
         dict with expression, eml_expression, mse, depth, constants, leaf_types.
     """
-    x_data = np.asarray(x_data, dtype=np.float64)
+    x_data, feature_names = _coerce_feature_matrix(
+        x_data,
+        feature_names=feature_names,
+        preserve_scalar_name=True,
+    )
     y_data = np.asarray(y_data, dtype=np.float64)
-    if x_data.ndim != 1 or y_data.ndim != 1:
-        raise ValueError("x_data and y_data must be 1D arrays")
-    if len(x_data) == 0 or len(y_data) == 0:
-        raise ValueError("x_data and y_data must be non-empty")
+    if y_data.ndim != 1:
+        raise ValueError("y_data must be a 1D array")
+    if len(y_data) == 0:
+        raise ValueError("y_data must be non-empty")
     if len(x_data) != len(y_data):
         raise ValueError("x_data and y_data must have the same length")
-    if not np.all(np.isfinite(x_data)) or not np.all(np.isfinite(y_data)):
-        raise ValueError("x_data and y_data must contain only finite values")
+    if not np.all(np.isfinite(y_data)):
+        raise ValueError("y_data must contain only finite values")
+    if x_data.shape[1] > MAX_SEARCH_FEATURES:
+        raise ValueError(
+            f"EML tree search currently supports at most {MAX_SEARCH_FEATURES} variables"
+        )
     if workers is None:
         workers = min(os.cpu_count() or 4, 8)
     rng = np.random.default_rng(seed)
+    feature_symbols = _feature_symbol_map(x_data, feature_names)
+    leaf_options = list(feature_names) + [ONE, ZERO, C]
 
-    best = _build_result(None, float("inf"), depth=None, strategy=None)
+    best = _build_result(
+        None,
+        float("inf"),
+        depth=None,
+        strategy=None,
+        feature_names=feature_names,
+    )
     t0 = time.time()
-    x_symbol = _x_symbol_for_data(x_data)
 
     def _update(lt, mse, consts, depth):
         if mse < best["mse"]:
             try:
-                sym = tree_to_sympy(lt, consts or None, x_symbol=x_symbol)
+                sym = tree_to_sympy(lt, consts or None, feature_symbols=feature_symbols)
             except Exception:
                 sym = None
+            used_features = _used_features_from_leaf_types(lt, feature_names)
             best.update(_build_result(
                 sym if sym is not None else _eml_str(lt, consts),
                 mse,
@@ -540,13 +794,15 @@ def symbolic_regression(x_data, y_data, max_depth=3, tolerance=1e-8,
                 constants=consts,
                 eml_expression=_eml_str(lt, consts),
                 strategy="eml_tree",
+                feature_names=feature_names,
+                used_features=used_features,
             ))
             if verbose and mse < 1.0:
                 print(f"  new best  MSE={mse:.2e}  {best['expression']}")
             return mse < tolerance
         return False
 
-    prepass = _fit_standard_forms(x_data, y_data, tolerance)
+    prepass = _fit_standard_forms(x_data, y_data, tolerance, feature_names, feature_symbols)
     if prepass is not None:
         if verbose:
             print("[pre-pass] exact fit found")
@@ -555,15 +811,15 @@ def symbolic_regression(x_data, y_data, max_depth=3, tolerance=1e-8,
 
     for depth in range(1, max_depth + 1):
         n_leaves = 2 ** depth
-        n_cfgs = len(LEAF_OPTIONS) ** n_leaves
+        n_cfgs = len(leaf_options) ** n_leaves
         exhaustive = n_cfgs <= EXHAUSTIVE_LIMIT
 
         if exhaustive:
-            all_cfgs = list(product(LEAF_OPTIONS, repeat=n_leaves))
+            all_cfgs = list(product(leaf_options, repeat=n_leaves))
         else:
-            all_cfgs = _sample_configs(n_leaves, max_random, rng)
+            all_cfgs = _sample_configs(n_leaves, max_random, rng, feature_names)
 
-        all_cfgs = [c for c in all_cfgs if X in c]
+        all_cfgs = [c for c in all_cfgs if _contains_feature(c)]
 
         if verbose:
             mode = "exhaustive" if exhaustive else f"sampling {max_random}"
@@ -572,11 +828,12 @@ def symbolic_regression(x_data, y_data, max_depth=3, tolerance=1e-8,
         # Phase 1: constant-free trees (instant)
         no_const = [c for c in all_cfgs if C not in c]
         leaf_cache = {
-            (X,): x_data,
-            (ONE,): np.ones_like(x_data),
-            (ZERO,): np.zeros_like(x_data),
+            (name,): x_data[:, idx]
+            for idx, name in enumerate(feature_names)
         }
-        sample_idx = np.linspace(0, len(x_data) - 1, num=min(5, len(x_data)), dtype=int)
+        leaf_cache[(ONE,)] = np.ones(len(y_data), dtype=np.float64)
+        leaf_cache[(ZERO,)] = np.zeros(len(y_data), dtype=np.float64)
+        sample_idx = np.linspace(0, len(y_data) - 1, num=min(5, len(y_data)), dtype=int)
         seen_fingerprints = set()
         unique_no_const = []
         for cfg in no_const:
@@ -600,7 +857,7 @@ def symbolic_regression(x_data, y_data, max_depth=3, tolerance=1e-8,
         # Phase 2: parallel quick screen
         has_const = [c for c in all_cfgs if C in c and not _should_prune_config(c)]
         task_specs = [
-            (list(cfg), list(cfg).count(C), int(rng.integers(0, 2**32 - 1)))
+            (list(cfg), list(cfg).count(C), int(rng.integers(0, 2**32 - 1)), feature_names)
             for cfg in has_const
         ]
         candidates = []
@@ -629,8 +886,10 @@ def symbolic_regression(x_data, y_data, max_depth=3, tolerance=1e-8,
                     _report(best, time.time() - t0)
                 return best
         else:
-            for lt, nc, task_seed in task_specs:
-                mse, lt, nc, consts = _screen_one((lt, x_data, y_data, nc, task_seed))
+            for lt, nc, task_seed, task_feature_names in task_specs:
+                mse, lt, nc, consts = _screen_one(
+                    (lt, x_data, y_data, nc, task_seed, task_feature_names)
+                )
                 if consts is None:
                     continue
                 candidates.append((mse, lt, nc, consts))
@@ -658,6 +917,7 @@ def symbolic_regression(x_data, y_data, max_depth=3, tolerance=1e-8,
                 nc,
                 rng=np.random.default_rng(int(rng.integers(0, 2**32 - 1))),
                 use_basinhopping=False,
+                feature_names=feature_names,
             )
             if consts is None:
                 continue
@@ -682,6 +942,8 @@ def _report(b, elapsed):
     print(f"  MSE     : {b['mse']:.2e}")
     depth = b.get("depth")
     depth_label = depth if depth is not None else "n/a"
+    used = ", ".join(b.get("used_features") or []) or "n/a"
+    print(f"  Features: {used}")
     print(f"  Depth   : {depth_label}   ({elapsed:.1f}s)")
     print(f"  {'='*50}")
 
@@ -696,9 +958,9 @@ def main():
     ap.add_argument("--demo", action="store_true",
                     help="Run demo on common functions")
     ap.add_argument("--json", type=str,
-                    help='JSON data file: {"x":[...], "y":[...]}')
+                    help='JSON data file: {"x":[...],"y":[...]} or {"x":[[...],[...]],"y":[...]}')
     ap.add_argument("--func", type=str,
-                    help='Generate data from expression, e.g. "sin(x)"')
+                    help='Generate 1D data from expression, e.g. "sin(x)"')
     ap.add_argument("--range", nargs=2, type=float, default=[0.1, 5.0],
                     metavar=("LO", "HI"),
                     help="x range for --func (default: 0.1 5.0)")
@@ -720,16 +982,19 @@ def main():
         _run_demo()
         return
 
+    feature_names = None
     if args.json:
         with open(args.json) as f:
             d = json.load(f)
         xd, yd = np.array(d["x"], float), np.array(d["y"], float)
+        feature_names = d.get("feature_names")
     elif args.func:
         xd = np.linspace(args.range[0], args.range[1], args.points)
         yd = sp.lambdify(sp.Symbol("x"), sp.sympify(args.func), "numpy")(xd)
     elif not sys.stdin.isatty():
         d = json.load(sys.stdin)
         xd, yd = np.array(d["x"], float), np.array(d["y"], float)
+        feature_names = d.get("feature_names")
         args.max_depth = d.get("max_depth", args.max_depth)
         args.seed = d.get("seed", args.seed)
         args.output_json = True
@@ -740,7 +1005,7 @@ def main():
 
     r = symbolic_regression(xd, yd, max_depth=args.max_depth,
                             tolerance=args.tolerance, verbose=not args.quiet,
-                            seed=args.seed)
+                            seed=args.seed, feature_names=feature_names)
     if args.output_json:
         print(json.dumps({
             "expression": r["expression"],
@@ -750,6 +1015,8 @@ def main():
             "mse": r["mse"],
             "constants": r["constants"],
             "leaf_types": r["leaf_types"],
+            "feature_names": r["feature_names"],
+            "used_features": r["used_features"],
         }, indent=2))
 
 
