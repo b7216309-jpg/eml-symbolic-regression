@@ -198,22 +198,22 @@ Tested on common functions, 200 data points, `x in [0.1, 4.0]`:
 
 | Target | Discovered | MSE | Depth | Time | Status |
 |--------|-----------|-----|-------|------|--------|
-| `exp(x)` | `exp(x)` | 0 | 1 | 0.1s | **EXACT** |
-| `1/x` | `1/x` | 6e-32 | 2 | 2s | **EXACT** |
-| `ln(x)` | `ln(x)` | 4e-33 | 3 | 33s | **EXACT** |
-| `exp(-x)` | `exp(-x)` | ~0 | 2 | 1s | **EXACT** |
-| `sin(x)` | approx | 7e-3 | 3 | 35s | Approx |
-| `x + 1` | approx | 6e-2 | 2 | 4s | Approx |
-| `x^2` | approx | 2e-1 | 3 | 35s | Approx |
+| `exp(x)` | `exp(x)` | ~0 | 0 | 0.1s | **EXACT** |
+| `1/x` | `1/x` | ~0 | 0 | 0.0s | **EXACT** |
+| `ln(x)` | `log(x)` | ~0 | 0 | 0.1s | **EXACT** |
+| `exp(-x)` | `exp(-x)` | ~0 | 0 | 0.1s | **EXACT** |
+| `x + 1` | `x + 1` | ~0 | 0 | 0.0s | **EXACT** |
+| `x^2` | `x**2` | ~0 | 0 | 0.0s | **EXACT** |
+| `sqrt(x)` | `sqrt(x)` | ~0 | 0 | 0.1s | **EXACT** |
+| `sin(x)` | approx | 1e-2 | 3 | 29s | Approx |
 
 ### Sweet spot
 
-Functions built from `exp` and `ln` are found **exactly** at shallow depth. This covers most of physics, biology, and finance: exponential growth/decay, power laws, logarithmic scaling, reciprocal relationships.
+Common exponentials, logarithms, power laws, and low-degree polynomials are found **exactly** and usually return before the EML tree search even starts. This covers exponential growth/decay, reciprocal relationships, roots, and standard algebraic forms.
 
 ### Honest limitations
 
-- **Polynomials** (`x+1`, `x^2`) are hard -- EML is fundamentally nonlinear, so linearity must emerge from cancellation
-- **Trig functions** need deeper trees (depth 4+) for exact results
+- **Oscillatory / trig functions** (`sin`, `cos`) still need deeper trees (depth 4+) for exact recovery
 - **Single variable** only -- no `f(x, y)` yet
 - **Clean data preferred** -- the optimizer can overfit to noise
 
@@ -242,7 +242,14 @@ Every expression is a **full binary tree** where:
                                                   ≈ 1/x  (when c → -inf)
 ```
 
-### The search (3 phases per depth)
+### The search
+
+```
+Phase 0  Hybrid exact-form pre-pass
+         Try cheap closed-form fits before touching the EML tree search.
+         Polynomial (deg 1-4), power law, exponential, logarithmic.
+         Solves x + 1, x^2, sqrt(x), 1/x, exp(x), ln(x) in milliseconds.
+```
 
 ```
 Phase 1  Instant eval

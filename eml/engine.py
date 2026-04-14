@@ -36,6 +36,8 @@ ZERO = "0"   # constant 0
 C    = "c"   # trainable constant (fitted to data)
 
 LEAF_OPTIONS = [X, ONE, ZERO, C]
+EXHAUSTIVE_LIMIT = 20000
+MIN_VALID_FRACTION = 0.9
 
 
 # ── Core EML operator ──────────────────────────────────────────────
@@ -48,6 +50,75 @@ def eml_np(a, b):
     """
     with np.errstate(all="ignore"):
         return np.exp(np.clip(a, -50, 50)) - np.log(np.maximum(np.abs(b), 1e-300))
+
+
+def _x_symbol_for_data(x_data):
+    """Pick the strongest safe assumption for x based on the observed domain."""
+    if len(x_data) and np.all(x_data > 0):
+        return sp.Symbol("x", positive=True, real=True)
+    if len(x_data) and np.all(x_data < 0):
+        return sp.Symbol("x", negative=True, real=True)
+    return sp.Symbol("x", real=True)
+
+
+def _score_prediction(pred, y_data, min_valid_fraction=MIN_VALID_FRACTION):
+    """Mean squared error with a penalty for partially invalid predictions."""
+    mask = np.isfinite(pred)
+    valid = int(mask.sum())
+    required = max(1, int(np.ceil(len(y_data) * min_valid_fraction)))
+    if valid < required:
+        return float("inf")
+    raw_mse = float(np.mean((pred[mask] - y_data[mask]) ** 2))
+    return raw_mse * (len(y_data) / valid)
+
+
+def _build_result(expression, mse, depth, leaf_types=None, constants=None, eml_expression=None):
+    """Normalise result payloads across search and pre-pass paths."""
+    return {
+        "expression": str(expression) if expression is not None else None,
+        "eml_expression": eml_expression,
+        "mse": float(mse),
+        "depth": depth,
+        "constants": list(constants or []),
+        "leaf_types": list(leaf_types) if leaf_types else [],
+    }
+
+
+def _fingerprint_array(values, sample_idx):
+    """Compact numeric signature for deduplicating constant-free trees."""
+    sample = values[sample_idx]
+    if not np.all(np.isfinite(sample)):
+        return None
+    return tuple(np.round(sample, 8))
+
+
+def _evaluate_constant_free_tree(leaf_types, cache):
+    """Evaluate a no-constant tree with memoised subtrees."""
+    key = tuple(leaf_types)
+    if key in cache:
+        return cache[key]
+    mid = len(key) // 2
+    value = eml_np(
+        _evaluate_constant_free_tree(key[:mid], cache),
+        _evaluate_constant_free_tree(key[mid:], cache),
+    )
+    cache[key] = value
+    return value
+
+
+def _should_prune_config(cfg):
+    """Skip trees with constant-only substructures that collapse to simpler forms."""
+    for i in range(0, len(cfg), 2):
+        pair = cfg[i:i + 2]
+        if X not in pair and pair.count(C) > 1:
+            return True
+
+    if len(cfg) >= 4:
+        for i in range(0, len(cfg), 4):
+            group = cfg[i:i + 4]
+            if X not in group and C in group:
+                return True
+    return False
 
 
 # ── Tree evaluation ─────────────────────────────────────────────────
@@ -85,20 +156,26 @@ def optimize_constants(leaf_types, x_data, y_data, n_constants,
     ~7ms per call (quick), ~15ms (full). Near-instant for 1-4 params.
     """
     if quick:
-        restarts, maxiter = 1, 200
+        restarts = 1
+        maxiter = max(200, 150 * n_constants)
     else:
-        maxiter = 2000
+        maxiter = max(2000, 500 * n_constants)
+
+    rng = np.random.default_rng()
+    base_scales = [0.5, 2.0, 10.0]
 
     def objective(c):
         pred = evaluate_tree(leaf_types, x_data, c)
-        mask = np.isfinite(pred)
-        if mask.sum() < len(y_data) * 0.5:
-            return 1e20
-        return float(np.mean((pred[mask] - y_data[mask]) ** 2))
+        mse = _score_prediction(pred, y_data)
+        return mse if np.isfinite(mse) else 1e20
 
     best_mse, best_c = float("inf"), None
     for r in range(restarts):
-        c0 = np.random.randn(n_constants) * (2.0 if r else 0.5)
+        if r < len(base_scales):
+            scale = base_scales[r]
+        else:
+            scale = 10 ** rng.uniform(-1.0, 1.0)
+        c0 = rng.normal(size=n_constants) * scale
         try:
             res = minimize(objective, c0, method="Nelder-Mead",
                            options={"maxiter": maxiter, "xatol": 1e-12, "fatol": 1e-12})
@@ -135,17 +212,80 @@ def _known_constants():
 def _nice(val, tol=1e-5):
     """Map a float to a clean sympy constant when possible."""
     for cv, sym in _known_constants():
-        if abs(val - cv) < tol:
+        threshold = min(tol, 1e-10) if cv == 0 else tol
+        if abs(val - cv) < threshold:
             return sym
     try:
-        return sp.nsimplify(val, rational=True, tolerance=tol)
+        candidate = sp.nsimplify(
+            val,
+            constants=[sp.pi, sp.E, sp.log(2), sp.sqrt(2), sp.sqrt(3)],
+            tolerance=tol,
+        )
+        if candidate.is_number:
+            approx = float(sp.N(candidate, 16))
+            if abs(approx - val) < tol and sp.count_ops(candidate) <= 3:
+                return candidate
     except Exception:
-        return sp.Float(val, 6)
+        pass
+    return sp.Float(val, 4)
 
 
-def tree_to_sympy(leaf_types, constants=None):
+def _fit_standard_forms(x_data, y_data, tolerance):
+    """Cheap exact-fit pre-pass for common one-variable function families."""
+    x_sym = _x_symbol_for_data(x_data)
+    nice_tol = max(tolerance, 1e-5)
+
+    def _maybe_result(pred, expr):
+        mse = _score_prediction(pred, y_data, min_valid_fraction=1.0)
+        if mse < tolerance:
+            return _build_result(sp.simplify(expr), mse, depth=0)
+        return None
+
+    for degree in range(1, 5):
+        if len(x_data) < degree + 1:
+            continue
+        coeffs = np.polyfit(x_data, y_data, degree)
+        pred = np.polyval(coeffs, x_data)
+        expr = sp.Integer(0)
+        for power, coeff in enumerate(reversed(coeffs)):
+            if abs(coeff) < nice_tol:
+                continue
+            expr += _nice(float(coeff), tol=nice_tol) * x_sym ** power
+        result = _maybe_result(pred, sp.expand(expr))
+        if result is not None:
+            return result
+
+    if np.all(x_data > 0) and np.all(y_data > 0):
+        slope, intercept = np.polyfit(np.log(x_data), np.log(y_data), 1)
+        scale = float(np.exp(intercept))
+        pred = scale * np.power(x_data, slope)
+        expr = _nice(scale, tol=nice_tol) * x_sym ** _nice(slope, tol=nice_tol)
+        result = _maybe_result(pred, expr)
+        if result is not None:
+            return result
+
+    if np.all(y_data > 0):
+        slope, intercept = np.polyfit(x_data, np.log(y_data), 1)
+        scale = float(np.exp(intercept))
+        pred = scale * np.exp(slope * x_data)
+        expr = _nice(scale, tol=nice_tol) * sp.exp(_nice(slope, tol=nice_tol) * x_sym)
+        result = _maybe_result(pred, expr)
+        if result is not None:
+            return result
+
+    if np.all(x_data > 0):
+        slope, intercept = np.polyfit(np.log(x_data), y_data, 1)
+        pred = slope * np.log(x_data) + intercept
+        expr = _nice(slope, tol=nice_tol) * sp.log(x_sym) + _nice(intercept, tol=nice_tol)
+        result = _maybe_result(pred, expr)
+        if result is not None:
+            return result
+    return None
+
+
+def tree_to_sympy(leaf_types, constants=None, x_symbol=None):
     """Convert an EML tree to a simplified sympy expression."""
-    x_sym = sp.Symbol("x")
+    x_sym = x_symbol if x_symbol is not None else sp.Symbol("x", real=True)
     c_idx = 0
     leaves = []
     for lt in leaf_types:
@@ -167,9 +307,9 @@ def tree_to_sympy(leaf_types, constants=None):
         nxt = []
         for i in range(0, len(cur), 2):
             a, b = cur[i], cur[i + 1]
-            if b == sp.Integer(0):
-                b = sp.Symbol("eps")
-            nxt.append(sp.exp(a) - sp.log(b))
+            if b.is_zero is True:
+                return None
+            nxt.append(sp.exp(a) - sp.log(sp.Abs(b)))
         cur = nxt
 
     result = cur[0]
@@ -177,7 +317,7 @@ def tree_to_sympy(leaf_types, constants=None):
         result = sp.simplify(result)
     except Exception:
         pass
-    if result.has(sp.nan, sp.zoo, sp.oo, sp.S.NegativeInfinity):
+    if result.has(sp.nan, sp.zoo, sp.oo, sp.S.NegativeInfinity, sp.I, sp.Symbol("eps")):
         return None
     return result
 
@@ -218,7 +358,8 @@ def symbolic_regression(x_data, y_data, max_depth=3, tolerance=1e-8,
                         verbose=True, max_random=10000, workers=None):
     """Search for the simplest EML tree that fits the data.
 
-    Three-phase search per depth level:
+    A cheap exact-form pre-pass runs before the EML search. If that misses,
+    each depth level uses three phases:
       1) Instant eval of constant-free trees (pure numpy)
       2) Parallel quick-screen of trees with trainable constants
       3) Full optimisation of top candidates
@@ -237,33 +378,51 @@ def symbolic_regression(x_data, y_data, max_depth=3, tolerance=1e-8,
     """
     x_data = np.asarray(x_data, dtype=np.float64)
     y_data = np.asarray(y_data, dtype=np.float64)
+    if x_data.ndim != 1 or y_data.ndim != 1:
+        raise ValueError("x_data and y_data must be 1D arrays")
+    if len(x_data) == 0 or len(y_data) == 0:
+        raise ValueError("x_data and y_data must be non-empty")
+    if len(x_data) != len(y_data):
+        raise ValueError("x_data and y_data must have the same length")
+    if not np.all(np.isfinite(x_data)) or not np.all(np.isfinite(y_data)):
+        raise ValueError("x_data and y_data must contain only finite values")
     if workers is None:
         workers = min(os.cpu_count() or 4, 8)
 
-    best = {"mse": float("inf")}
+    best = _build_result(None, float("inf"), depth=None)
     t0 = time.time()
+    x_symbol = _x_symbol_for_data(x_data)
 
     def _update(lt, mse, consts, depth):
         if mse < best["mse"]:
             try:
-                sym = tree_to_sympy(lt, consts or None)
+                sym = tree_to_sympy(lt, consts or None, x_symbol=x_symbol)
             except Exception:
                 sym = None
-            best.update({
-                "mse": mse, "depth": depth, "leaf_types": lt,
-                "constants": consts,
-                "eml_expression": _eml_str(lt, consts),
-                "expression": str(sym) if sym else _eml_str(lt, consts),
-            })
+            best.update(_build_result(
+                sym if sym is not None else _eml_str(lt, consts),
+                mse,
+                depth,
+                leaf_types=lt,
+                constants=consts,
+                eml_expression=_eml_str(lt, consts),
+            ))
             if verbose and mse < 1.0:
                 print(f"  new best  MSE={mse:.2e}  {best['expression']}")
             return mse < tolerance
         return False
 
+    prepass = _fit_standard_forms(x_data, y_data, tolerance)
+    if prepass is not None:
+        if verbose:
+            print("[pre-pass] exact fit found")
+            _report(prepass, time.time() - t0)
+        return prepass
+
     for depth in range(1, max_depth + 1):
         n_leaves = 2 ** depth
         n_cfgs = len(LEAF_OPTIONS) ** n_leaves
-        exhaustive = n_cfgs <= 20000
+        exhaustive = n_cfgs <= EXHAUSTIVE_LIMIT
 
         if exhaustive:
             all_cfgs = list(product(LEAF_OPTIONS, repeat=n_leaves))
@@ -279,23 +438,34 @@ def symbolic_regression(x_data, y_data, max_depth=3, tolerance=1e-8,
 
         # Phase 1: constant-free trees (instant)
         no_const = [c for c in all_cfgs if C not in c]
+        leaf_cache = {
+            (X,): x_data,
+            (ONE,): np.ones_like(x_data),
+            (ZERO,): np.zeros_like(x_data),
+        }
+        sample_idx = np.linspace(0, len(x_data) - 1, num=min(5, len(x_data)), dtype=int)
+        seen_fingerprints = set()
+        unique_no_const = []
         for cfg in no_const:
             lt = list(cfg)
-            pred = evaluate_tree(lt, x_data)
-            mask = np.isfinite(pred)
-            mse = (float(np.mean((pred[mask] - y_data[mask]) ** 2))
-                   if mask.sum() > len(y_data) * 0.5 else float("inf"))
+            pred = _evaluate_constant_free_tree(lt, leaf_cache)
+            fp = _fingerprint_array(pred, sample_idx)
+            if fp is None or fp in seen_fingerprints:
+                continue
+            seen_fingerprints.add(fp)
+            unique_no_const.append(cfg)
+            mse = _score_prediction(pred, y_data)
             if _update(lt, mse, [], depth):
                 if verbose:
                     _report(best, time.time() - t0)
                 return best
 
         if verbose:
-            print(f"  phase 1  ({len(no_const):>5} trees, no constants): "
+            print(f"  phase 1  ({len(unique_no_const):>5} unique trees, no constants): "
                   f"best MSE = {best['mse']:.2e}")
 
         # Phase 2: parallel quick screen
-        has_const = [c for c in all_cfgs if C in c]
+        has_const = [c for c in all_cfgs if C in c and not _should_prune_config(c)]
         tasks = [(list(cfg), x_data, y_data, list(cfg).count(C))
                  for cfg in has_const]
         candidates = []
@@ -349,10 +519,12 @@ def symbolic_regression(x_data, y_data, max_depth=3, tolerance=1e-8,
 
 def _report(b, elapsed):
     print(f"\n  {'='*50}")
-    print(f"  Formula : {b['expression']}")
-    print(f"  EML tree: {b['eml_expression']}")
+    print(f"  Formula : {b.get('expression') or 'none'}")
+    print(f"  EML tree: {b.get('eml_expression') or 'n/a'}")
     print(f"  MSE     : {b['mse']:.2e}")
-    print(f"  Depth   : {b['depth']}   ({elapsed:.1f}s)")
+    depth = b.get("depth")
+    depth_label = depth if depth is not None else "n/a"
+    print(f"  Depth   : {depth_label}   ({elapsed:.1f}s)")
     print(f"  {'='*50}")
 
 
