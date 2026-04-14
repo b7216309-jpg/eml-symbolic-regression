@@ -123,6 +123,7 @@ def _handle_eml_regression(args: dict, **kwargs) -> str:
         "expression": result["expression"],
         "eml_expression": result["eml_expression"],
         "depth": result["depth"],
+        "strategy": result.get("strategy"),
         "mse": mse,
         "quality": quality,
         "constants": result["constants"],

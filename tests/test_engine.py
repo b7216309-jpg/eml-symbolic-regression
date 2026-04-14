@@ -76,6 +76,7 @@ class RegressionTests(unittest.TestCase):
             with self.subTest(name=name):
                 result = regress(x_data, y_data, max_depth=3, verbose=False)
                 self.assertLess(result["mse"], 1e-8)
+                self.assertEqual(result["strategy"], "prepass")
                 for banned in ("eps", "I*pi", "zoo", "nan"):
                     self.assertNotIn(banned, result["expression"] or "")
 
@@ -88,6 +89,7 @@ class RegressionTests(unittest.TestCase):
 
         self.assertEqual(result_a["leaf_types"], result_b["leaf_types"])
         self.assertEqual(result_a["expression"], result_b["expression"])
+        self.assertEqual(result_a["strategy"], result_b["strategy"])
         self.assertAlmostEqual(result_a["mse"], result_b["mse"])
         np.testing.assert_allclose(result_a["constants"], result_b["constants"], rtol=0, atol=1e-12)
 

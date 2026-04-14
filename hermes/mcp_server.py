@@ -74,6 +74,7 @@ def eml_symbolic_regression(
         "expression": result["expression"],
         "eml_expression": result["eml_expression"],
         "depth": result["depth"],
+        "strategy": result.get("strategy"),
         "mse": mse,
         "quality": quality,
         "constants": result["constants"],

@@ -82,7 +82,8 @@ def _score_prediction(pred, y_data, min_valid_fraction=MIN_VALID_FRACTION):
     return raw_mse * (len(y_data) / valid)
 
 
-def _build_result(expression, mse, depth, leaf_types=None, constants=None, eml_expression=None):
+def _build_result(expression, mse, depth, leaf_types=None, constants=None,
+                  eml_expression=None, strategy=None):
     """Normalise result payloads across search and pre-pass paths."""
     return {
         "expression": str(expression) if expression is not None else None,
@@ -91,6 +92,7 @@ def _build_result(expression, mse, depth, leaf_types=None, constants=None, eml_e
         "depth": depth,
         "constants": list(constants or []),
         "leaf_types": list(leaf_types) if leaf_types else [],
+        "strategy": strategy,
     }
 
 
@@ -356,7 +358,7 @@ def _fit_standard_forms(x_data, y_data, tolerance):
     def _maybe_result(pred, expr):
         mse = _score_prediction(pred, y_data, min_valid_fraction=1.0)
         if mse < tolerance:
-            return _build_result(sp.simplify(expr), mse, depth=0)
+            return _build_result(sp.simplify(expr), mse, depth=0, strategy="prepass")
         return None
 
     for degree in range(1, 5):
@@ -520,7 +522,7 @@ def symbolic_regression(x_data, y_data, max_depth=3, tolerance=1e-8,
         workers = min(os.cpu_count() or 4, 8)
     rng = np.random.default_rng(seed)
 
-    best = _build_result(None, float("inf"), depth=None)
+    best = _build_result(None, float("inf"), depth=None, strategy=None)
     t0 = time.time()
     x_symbol = _x_symbol_for_data(x_data)
 
@@ -537,6 +539,7 @@ def symbolic_regression(x_data, y_data, max_depth=3, tolerance=1e-8,
                 leaf_types=lt,
                 constants=consts,
                 eml_expression=_eml_str(lt, consts),
+                strategy="eml_tree",
             ))
             if verbose and mse < 1.0:
                 print(f"  new best  MSE={mse:.2e}  {best['expression']}")
@@ -743,6 +746,7 @@ def main():
             "expression": r["expression"],
             "eml_expression": r["eml_expression"],
             "depth": r["depth"],
+            "strategy": r["strategy"],
             "mse": r["mse"],
             "constants": r["constants"],
             "leaf_types": r["leaf_types"],
