@@ -1,28 +1,25 @@
 {
-  "type": "function",
-  "function": {
-    "name": "eml_symbolic_regression",
-    "description": "Discover the mathematical formula underlying numerical data. Given x and y arrays, finds the simplest closed-form expression y=f(x). Uses the EML operator eml(a,b)=exp(a)-ln(b) which can represent ALL elementary functions. Returns the formula in standard math notation. Use when: finding a formula from data points, identifying a function behind a pattern, verifying a mathematical relationship, or converting numerical data to symbolic form.",
-    "parameters": {
-      "type": "object",
-      "properties": {
-        "x": {
-          "type": "array",
-          "items": { "type": "number" },
-          "description": "Input x values (at least 20 points, avoid x=0)"
-        },
-        "y": {
-          "type": "array",
-          "items": { "type": "number" },
-          "description": "Output y values corresponding to each x"
-        },
-        "max_depth": {
-          "type": "integer",
-          "default": 3,
-          "description": "Max tree depth 1-4. Higher = more complex functions, slower."
-        }
+  "name": "eml_symbolic_regression",
+  "description": "Discover the mathematical formula underlying numerical data. Given x and y arrays, finds the simplest closed-form expression y=f(x). Uses the EML operator eml(a,b)=exp(a)-ln(b) which can represent ALL elementary functions. Returns the formula in standard math notation. Use when: finding a formula from data points, identifying a function behind a pattern, verifying a mathematical relationship, or converting numerical data to symbolic form.",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "x": {
+        "type": "array",
+        "items": { "type": "number" },
+        "description": "Input x values (at least 20 points, avoid x=0)"
       },
-      "required": ["x", "y"]
-    }
+      "y": {
+        "type": "array",
+        "items": { "type": "number" },
+        "description": "Output y values corresponding to each x"
+      },
+      "max_depth": {
+        "type": "integer",
+        "default": 3,
+        "description": "Max tree depth 1-4. 1-2: basic ops (exp, ln, powers). 3: most elementary functions. 4: complex compositions (slower)."
+      }
+    },
+    "required": ["x", "y"]
   }
 }

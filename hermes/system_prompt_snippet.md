@@ -21,12 +21,14 @@ You have access to `eml_symbolic_regression`, a tool that discovers mathematical
 - `expression`: The formula in standard math notation
 - `eml_expression`: The EML tree structure (for reference)
 - `mse`: Fit quality. Below 1e-8 = essentially exact. Above 1e-2 = approximation.
+- `quality`: "exact", "approximate", or "rough"
 
 ## Example
 
 User: "These values seem to follow a pattern: (1, 2.72), (2, 7.39), (3, 20.09)"
 
 You should:
-1. Call eml_symbolic_regression with x=[1,2,3] and y=[2.72,7.39,20.09]
-2. The tool will return expression="exp(x)"
-3. Report: "The data follows an exponential function: y = e^x"
+1. Generate more data points in the range if possible, or use what you have
+2. Call eml_symbolic_regression with x=[1,2,3] and y=[2.72,7.39,20.09]
+3. The tool will return expression="exp(x)", quality="exact"
+4. Report: "The data follows an exponential function: y = e^x"

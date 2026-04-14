@@ -105,7 +105,7 @@ echo '{"x": [...], "y": [...]}' | eml-regress --output-json
 
 ---
 
-## Hermes Integration
+## Hermes Agent Integration
 
 This tool was designed to give **small local LLMs** mathematical capabilities they can't have natively. A 7B Hermes model that can call this tool outperforms a 70B model doing math from memory.
 
@@ -118,20 +118,48 @@ User: "What formula fits this data?"
           |
     Calls eml_symbolic_regression tool
           |
-    Gets back {"expression": "exp(x)", "mse": 0.0}
+    Gets back {"expression": "exp(x)", "quality": "exact"}
           |
     Reports: "The data follows y = e^x"
 ```
 
 **The model orchestrates. The tool does the math.**
 
-### Setup
+### Three integration paths
 
-1. Copy `hermes/tool_schema.json` -- this is the OpenAI-compatible function definition
-2. Add `hermes/system_prompt_snippet.md` to your system prompt
-3. Route tool calls to: `echo $ARGS | python -m eml.engine`
+Pick the one that fits your setup:
 
-The tool reads JSON from stdin, writes JSON to stdout. Works with any OpenAI-compatible tool calling framework (llama.cpp, vLLM, Ollama, etc.)
+#### Option A -- Native tool (tightest integration)
+
+Copy `hermes/hermes_tool.py` into your `hermes-agent/tools/` directory.
+Make sure it gets imported at startup. Done.
+
+```python
+# hermes_tool.py auto-registers with the Hermes ToolRegistry:
+#   name:    "eml_symbolic_regression"
+#   toolset: "math"
+#   handler: Python callable (no subprocess, no shell)
+```
+
+The handler calls `from eml import regress` directly -- no stdin/stdout, no CLI wrapping. This is how Hermes native tools work: Python function in, JSON string out.
+
+#### Option B -- MCP server (no code changes to Hermes)
+
+Add to `~/.hermes/config.yaml`:
+
+```yaml
+mcp_servers:
+  eml:
+    command: python
+    args: ["/path/to/eml-symbolic-regression/hermes/mcp_server.py"]
+    timeout: 120
+```
+
+Hermes auto-discovers the tool as `mcp_eml_eml_symbolic_regression` via the MCP stdio protocol. No changes to the Hermes codebase needed.
+
+#### Option C -- Skill only (prompt-based guidance)
+
+Copy `hermes/skill/` into your `hermes-agent/skills/math/symbolic-regression/` directory. This adds a skill entry that teaches Hermes *when* and *how* to use the tool, including fallback strategies when results are approximate.
 
 ### What the LLM needs to do
 
@@ -142,6 +170,14 @@ Almost nothing. It just needs to:
 4. Report the result
 
 No chain-of-thought math. No symbolic manipulation. No arithmetic. The transformer does what it's good at (language), the tool does what it's good at (math).
+
+### Works with any OpenAI-compatible framework
+
+The tool schema in `hermes/tool_schema.json` is standard OpenAI function-calling format. If you're using vLLM, Ollama, or raw llama.cpp instead of hermes-agent, the stdin/stdout CLI mode still works:
+
+```bash
+echo '{"x": [1,2,3,4], "y": [2.72,7.39,20.09,54.60]}' | python -m eml.engine
+```
 
 ---
 
@@ -231,19 +267,22 @@ EML has **one operator**. The search space is a set of binary trees with uniform
 ```
 eml-symbolic-regression/
   eml/
-    __init__.py          Clean API: from eml import regress
-    engine.py            Core search engine
+    __init__.py              Clean API: from eml import regress
+    engine.py                Core search engine (3-phase parallel search)
   hermes/
-    tool_schema.json     OpenAI function-calling definition
-    system_prompt_snippet.md   Drop-in system prompt for Hermes
-    llamacpp_example.sh  End-to-end llama.cpp example
+    hermes_tool.py           Native Hermes tool module (drop into tools/)
+    mcp_server.py            MCP stdio server (configure in config.yaml)
+    tool_schema.json         OpenAI function-calling schema (inner format)
+    system_prompt_snippet.md System prompt addition for tool guidance
+    skill/
+      SKILL.md               Hermes skill definition (prompt-based)
   examples/
-    quickstart.py        3-line usage
-    from_data_points.py  Realistic scenario (RC circuit)
-    benchmark.py         Performance table
-    cli_examples.sh      CLI usage patterns
-  pyproject.toml         pip installable
-  LICENSE                MIT
+    quickstart.py            3-line usage
+    from_data_points.py      Realistic scenario (RC circuit decay)
+    benchmark.py             Performance table generator
+    cli_examples.sh          CLI usage patterns
+  pyproject.toml             pip installable
+  LICENSE                    MIT
 ```
 
 ---
