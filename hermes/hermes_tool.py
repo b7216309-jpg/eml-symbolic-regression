@@ -84,10 +84,17 @@ EML_SCHEMA = {
                 "type": "integer",
                 "default": 3,
                 "description": (
-                    "Max tree depth 1-4. "
-                    "1-2: basic ops (exp, ln, powers). "
-                    "3: most elementary functions. "
-                    "4: complex compositions (slower)."
+                    "Optional explicit tree-depth override. Leave unset to let "
+                    "the selected mode choose the budget automatically."
+                ),
+            },
+            "mode": {
+                "type": "string",
+                "enum": ["auto", "instant", "balanced", "deep", "research"],
+                "default": "auto",
+                "description": (
+                    "Search budget preset. Use auto to follow the dataset "
+                    "analyzer's recommended mode."
                 ),
             },
             "analysis_only": {
@@ -130,7 +137,8 @@ def _handle_eml_regression(args: dict, **kwargs) -> str:
     x = args.get("X", args.get("x"))
     y = args.get("y")
     feature_names = args.get("feature_names")
-    max_depth = args.get("max_depth", 3)
+    max_depth = args.get("max_depth")
+    mode = args.get("mode", "auto")
     analysis_only = bool(args.get("analysis_only", False))
 
     if not x or not y:
@@ -150,9 +158,10 @@ def _handle_eml_regression(args: dict, **kwargs) -> str:
         result = regress(
             x_array,
             y_array,
-            max_depth=int(max_depth),
+            max_depth=int(max_depth) if max_depth is not None else None,
             verbose=False,
             feature_names=feature_names,
+            mode=mode,
         )
     except Exception as e:
         return tool_error(f"Regression failed: {str(e)}")

@@ -33,6 +33,9 @@ print(result["expression"])  # exp(x)
 
 # Reproducible search when you want stable comparisons
 result = regress(x, y, seed=123)
+
+# Or let the analyzer pick a search budget
+result = regress(x, y, mode="auto")
 ```
 
 ## Why this exists
@@ -153,6 +156,14 @@ print(analysis["likely_families"][0])       # cheap heuristic classifier
 print(analysis["should_attempt_regression"])
 ```
 
+Search presets:
+
+- `instant`: shallow, fast checks for cheap wins
+- `balanced`: current default tradeoff for normal use
+- `deep`: larger search budget for harder symbolic fits
+- `research`: heaviest built-in budget
+- `auto`: follow `analyze(...)[\"recommended_mode\"]`
+
 ### CLI
 
 ```bash
@@ -161,6 +172,9 @@ eml-regress --func "exp(x)" --range 0.1 5
 
 # Deterministic search
 eml-regress --func "sin(x)" --range 0.1 5 --seed 123
+
+# Auto-budgeted search
+eml-regress --func "exp(x)" --range 0.1 5 --mode auto
 
 # From JSON data
 echo '{"x": [1,2,3,4], "y": [2.72,7.39,20.09,54.60]}' | eml-regress
@@ -178,7 +192,7 @@ echo '{"x": [[0.1,0.5],[0.2,0.5],[0.1,0.7],[0.2,0.7]], "y": [0.6,0.7,0.8,0.9], "
 echo '{"x": [...], "y": [...]}' | eml-regress --output-json
 ```
 
-JSON output includes the full structured result object, including `analysis`, `verification`, `confidence`, `failure_modes`, `candidates`, and `guidance`.
+JSON output includes the full structured result object, including `analysis`, `verification`, `confidence`, `failure_modes`, `candidates`, `guidance`, `requested_mode`, `effective_mode`, and `search_budget`.
 
 ---
 
@@ -228,7 +242,7 @@ Native Hermes responses include:
 - `depth`: EML depth only; `0` means the hybrid pre-pass solved it
 - `mse`, `constants`, `eml_expression`, `feature_names`, `used_features`
 
-Python and CLI calls also expose `seed` for deterministic search. The Hermes native wrapper exposes `x`, `y`, optional `feature_names`, and `max_depth`, where `x` can be a 1D array or a 2D matrix.
+Python and CLI calls also expose `seed` for deterministic search plus `mode` for budgeted search. The Hermes native wrapper exposes `x`, `y`, optional `feature_names`, `max_depth`, and `mode`, where `x` can be a 1D array or a 2D matrix.
 
 #### Option B -- Skill only
 

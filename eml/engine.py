@@ -40,6 +40,12 @@ LEAF_OPTIONS = [X, ONE, ZERO, C]
 MAX_SEARCH_FEATURES = 3
 EXHAUSTIVE_LIMIT = 20000
 MIN_VALID_FRACTION = 0.9
+SEARCH_MODE_PRESETS = {
+    "instant": {"max_depth": 2, "max_random": 1500},
+    "balanced": {"max_depth": 3, "max_random": 10000},
+    "deep": {"max_depth": 4, "max_random": 30000},
+    "research": {"max_depth": 5, "max_random": 60000},
+}
 SAMPLE_BUCKET_WEIGHTS = {
     0: 0.10,
     1: 0.30,
@@ -211,6 +217,33 @@ def _quality_from_metrics(mse, y_data, tolerance):
     if nrmse < 0.10 or mse < max(1e-2, tolerance * 1e5):
         return "approximate"
     return "rough"
+
+
+def _resolve_search_budget(mode, max_depth, max_random, analysis):
+    """Turn a search mode plus optional overrides into concrete limits."""
+    requested_mode = mode or "balanced"
+    if requested_mode == "auto":
+        effective_mode = analysis.get("recommended_mode", "balanced")
+    else:
+        effective_mode = requested_mode
+
+    if effective_mode not in SEARCH_MODE_PRESETS:
+        allowed = ", ".join(["auto"] + list(SEARCH_MODE_PRESETS))
+        raise ValueError(f"mode must be one of: {allowed}")
+
+    preset = SEARCH_MODE_PRESETS[effective_mode]
+    resolved_max_depth = int(max_depth if max_depth is not None else preset["max_depth"])
+    resolved_max_random = int(max_random if max_random is not None else preset["max_random"])
+    if resolved_max_depth < 1:
+        raise ValueError("max_depth must be >= 1")
+    if resolved_max_random < 1:
+        raise ValueError("max_random must be >= 1")
+    return {
+        "requested_mode": requested_mode,
+        "effective_mode": effective_mode,
+        "max_depth": resolved_max_depth,
+        "max_random": resolved_max_random,
+    }
 
 
 def _result_complexity(expression, leaf_types=None):
@@ -855,7 +888,8 @@ def _guidance_summary(best, analysis, verification, candidates, x_data, feature_
     }
 
 
-def _finalize_result(best, x_data, y_data, feature_names, analysis, candidate_board, tolerance):
+def _finalize_result(best, x_data, y_data, feature_names, analysis, candidate_board, tolerance,
+                     budget=None):
     """Attach diagnostics, confidence, and candidates to the best fit."""
     best = dict(best)
     best["analysis"] = analysis
@@ -872,6 +906,13 @@ def _finalize_result(best, x_data, y_data, feature_names, analysis, candidate_bo
     best["failure_modes"] = verification["failure_modes"]
     best["confidence"] = _confidence_summary(best, analysis, verification)
     best["guidance"] = _guidance_summary(best, analysis, verification, candidates or [best], x_data, feature_names)
+    if budget is not None:
+        best["requested_mode"] = budget["requested_mode"]
+        best["effective_mode"] = budget["effective_mode"]
+        best["search_budget"] = {
+            "max_depth": budget["max_depth"],
+            "max_random": budget["max_random"],
+        }
     return best
 
 
@@ -1510,9 +1551,9 @@ def _screen_one(args):
     return mse, lt, nc, consts
 
 
-def symbolic_regression(x_data, y_data, max_depth=3, tolerance=1e-8,
-                        verbose=True, max_random=10000, workers=None, seed=None,
-                        feature_names=None):
+def symbolic_regression(x_data, y_data, max_depth=None, tolerance=1e-8,
+                        verbose=True, max_random=None, workers=None, seed=None,
+                        feature_names=None, mode=None):
     """Search for the simplest EML tree that fits the data.
 
     A cheap exact-form pre-pass runs before the EML search. If that misses,
@@ -1524,12 +1565,13 @@ def symbolic_regression(x_data, y_data, max_depth=3, tolerance=1e-8,
     Args:
         x_data:     Input vector or feature matrix.
         y_data:     Target array.
-        max_depth:  Max tree depth (1-4). 3 recommended.
+        max_depth:  Optional explicit tree-depth override.
         tolerance:  Early-stop MSE threshold.
         verbose:    Print progress.
-        max_random: Sample count when exhaustive search is too large.
+        max_random: Optional explicit sample count when exhaustive search is too large.
         workers:    Parallel workers (default: auto).
         seed:       Optional RNG seed for deterministic search/optimisation.
+        mode:       Search preset: instant, balanced, deep, research, or auto.
 
     Returns:
         dict with expression, eml_expression, mse, depth, constants, leaf_types.
@@ -1550,6 +1592,9 @@ def symbolic_regression(x_data, y_data, max_depth=3, tolerance=1e-8,
     leaf_options = list(feature_names) + [ONE, ZERO, C]
     analysis = analyze_dataset(x_data, y_data, feature_names=feature_names)
     candidate_board = _empty_candidate_board()
+    budget = _resolve_search_budget(mode, max_depth, max_random, analysis)
+    max_depth = budget["max_depth"]
+    max_random = budget["max_random"]
 
     best = _build_result(
         None,
@@ -1569,6 +1614,7 @@ def symbolic_regression(x_data, y_data, max_depth=3, tolerance=1e-8,
             analysis,
             candidate_board,
             tolerance,
+            budget=budget,
         )
         if verbose:
             _report(final, time.time() - t0)
@@ -1619,8 +1665,11 @@ def symbolic_regression(x_data, y_data, max_depth=3, tolerance=1e-8,
         all_cfgs = [c for c in all_cfgs if _contains_feature(c)]
 
         if verbose:
-            mode = "exhaustive" if exhaustive else f"sampling {max_random}"
-            print(f"[depth {depth}] {n_leaves} leaves | {mode} | {len(all_cfgs)} viable")
+            search_mode = "exhaustive" if exhaustive else f"sampling {max_random}"
+            print(
+                f"[depth {depth}] {n_leaves} leaves | {search_mode} | "
+                f"{len(all_cfgs)} viable | budget={budget['effective_mode']}"
+            )
 
         # Phase 1: constant-free trees (instant)
         no_const = [c for c in all_cfgs if C not in c]
@@ -1739,6 +1788,8 @@ def _report(b, elapsed):
     print(f"  EML tree: {b.get('eml_expression') or 'n/a'}")
     print(f"  MSE     : {b['mse']:.2e}")
     print(f"  Quality : {b.get('quality') or 'n/a'}")
+    if b.get("effective_mode"):
+        print(f"  Mode    : {b.get('effective_mode')} (requested {b.get('requested_mode')})")
     depth = b.get("depth")
     depth_label = depth if depth is not None else "n/a"
     used = ", ".join(b.get("used_features") or []) or "n/a"
@@ -1770,8 +1821,11 @@ def main():
                     help="x range for --func (default: 0.1 5.0)")
     ap.add_argument("--points", type=int, default=200,
                     help="Number of data points (default: 200)")
-    ap.add_argument("--max-depth", type=int, default=3,
-                    help="Maximum tree depth 1-4 (default: 3)")
+    ap.add_argument("--max-depth", type=int,
+                    help="Optional explicit maximum tree depth override")
+    ap.add_argument("--mode", type=str, default="auto",
+                    choices=["auto", "instant", "balanced", "deep", "research"],
+                    help="Search budget preset (default: auto)")
     ap.add_argument("--tolerance", type=float, default=1e-8,
                     help="MSE tolerance for early stop (default: 1e-8)")
     ap.add_argument("--seed", type=int,
@@ -1792,6 +1846,7 @@ def main():
             d = json.load(f)
         xd, yd = np.array(d["x"], float), np.array(d["y"], float)
         feature_names = d.get("feature_names")
+        args.mode = d.get("mode", args.mode)
     elif args.func:
         xd = np.linspace(args.range[0], args.range[1], args.points)
         yd = sp.lambdify(sp.Symbol("x"), sp.sympify(args.func), "numpy")(xd)
@@ -1800,6 +1855,7 @@ def main():
         xd, yd = np.array(d["x"], float), np.array(d["y"], float)
         feature_names = d.get("feature_names")
         args.max_depth = d.get("max_depth", args.max_depth)
+        args.mode = d.get("mode", args.mode)
         args.seed = d.get("seed", args.seed)
         args.output_json = True
         args.quiet = True
@@ -1809,7 +1865,8 @@ def main():
 
     r = symbolic_regression(xd, yd, max_depth=args.max_depth,
                             tolerance=args.tolerance, verbose=not args.quiet,
-                            seed=args.seed, feature_names=feature_names)
+                            seed=args.seed, feature_names=feature_names,
+                            mode=args.mode)
     if args.output_json:
         print(json.dumps(r, indent=2))
 

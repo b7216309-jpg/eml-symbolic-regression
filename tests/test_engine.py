@@ -209,6 +209,28 @@ class RegressionTests(unittest.TestCase):
         self.assertIn("why_best", result["guidance"])
         self.assertEqual(result["analysis"]["feature_names"], ["x"])
 
+    def test_auto_mode_uses_analysis_recommendation(self):
+        x_data = np.linspace(0.2, 4.0, 120)
+        y_data = np.exp(x_data)
+
+        result = regress(x_data, y_data, verbose=False, mode="auto")
+
+        self.assertEqual(result["requested_mode"], "auto")
+        self.assertEqual(result["effective_mode"], "instant")
+        self.assertEqual(result["search_budget"]["max_depth"], 2)
+        self.assertEqual(result["analysis"]["recommended_mode"], "instant")
+
+    def test_explicit_mode_overrides_default_budget(self):
+        x_data = np.linspace(0.2, 4.0, 120)
+        y_data = np.exp(x_data)
+
+        result = regress(x_data, y_data, verbose=False, mode="deep")
+
+        self.assertEqual(result["requested_mode"], "deep")
+        self.assertEqual(result["effective_mode"], "deep")
+        self.assertEqual(result["search_budget"]["max_depth"], 4)
+        self.assertEqual(result["search_budget"]["max_random"], 30000)
+
     def test_two_variable_tree_search_finds_direct_eml_form(self):
         x0 = np.linspace(0.1, 1.2, 80)
         x1 = np.linspace(1.1, 2.8, 80)
@@ -246,6 +268,8 @@ class RegressionTests(unittest.TestCase):
             regress(np.ones((10, 4)), np.ones(10), verbose=False)
         with self.assertRaises(ValueError):
             regress(np.ones((10, 2)), np.ones(10), verbose=False, feature_names=["only_one"])
+        with self.assertRaises(ValueError):
+            regress([1.0, 2.0, 3.0], [1.0, 4.0, 9.0], verbose=False, mode="turbo")
 
 
 if __name__ == "__main__":

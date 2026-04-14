@@ -32,8 +32,13 @@
       },
       "max_depth": {
         "type": "integer",
-        "default": 3,
-        "description": "Max tree depth 1-4. 1-2: basic ops (exp, ln, powers). 3: most elementary functions. 4: complex compositions (slower)."
+        "description": "Optional explicit tree-depth override. Leave unset to let the selected mode choose the budget automatically."
+      },
+      "mode": {
+        "type": "string",
+        "enum": ["auto", "instant", "balanced", "deep", "research"],
+        "default": "auto",
+        "description": "Search budget preset. Use auto to follow the dataset analyzer's recommended mode."
       },
       "analysis_only": {
         "type": "boolean",
