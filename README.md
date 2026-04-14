@@ -19,7 +19,7 @@
 
 **Discover exact mathematical formulas from raw numerical data.**
 
-Feed in data points. Get back `exp(x)`, `1/x`, `ln(x)` -- not a neural net approximation, not a polynomial fit, but the actual symbolic formula. Powered by a single binary operator that can express every elementary function in mathematics.
+Feed in data points. Get back `exp(x)`, `1/x`, `ln(x)` -- not a neural net approximation, not a polynomial fit, but the actual symbolic formula. The engine now uses a hybrid exact-form pre-pass before falling back to EML tree search, so simple closed forms can return immediately while harder functions still use the uniform EML grammar.
 
 ```python
 from eml import regress
@@ -60,7 +60,7 @@ You have data. You need the formula. Traditional options:
 | GP symbolic regression (PySR etc.) | Large grammar, slow, non-deterministic |
 | Ask an LLM | Hallucinated arithmetic, wrong answers |
 
-EML symbolic regression searches a **minimal, complete grammar**. One operator, exhaustive search at shallow depths, gradient-free constant optimisation. If the formula exists, it finds it.
+EML symbolic regression searches a **minimal, complete grammar**. One operator, exhaustive or stratified search at shallow depths, gradient-free constant optimisation, and a cheap closed-form pre-pass for standard families.
 
 ---
 
@@ -89,9 +89,19 @@ y = np.array([2.0, 1.0, 0.667, 0.5, 0.4, 0.333, 0.286, 0.25])
 result = regress(x, y, max_depth=2)
 
 print(result["expression"])      # 1/x
-print(result["eml_expression"])  # eml(eml(tiny, x), eml(0, 1))
+print(result["strategy"])        # prepass
+print(result["depth"])           # 0  (no EML tree was needed)
+print(result["eml_expression"])  # None for prepass hits
 print(result["mse"])             # ~6e-32
 ```
+
+Result fields:
+
+- `expression`: simplified symbolic expression to show the model or user
+- `strategy`: `"prepass"` for closed-form hits, `"eml_tree"` for actual EML-tree discoveries
+- `depth`: EML tree depth only; `0` means the pre-pass solved it before tree search
+- `eml_expression`: raw EML tree string, or `null`/`None` when the pre-pass found the answer
+- `mse`, `constants`, `leaf_types`: fit quality and low-level search details
 
 ### CLI
 
@@ -107,6 +117,8 @@ echo '{"x": [1,2,3,4], "y": [2.72,7.39,20.09,54.60]}' | eml-regress
 
 # JSON output for automation
 echo '{"x": [...], "y": [...]}' | eml-regress --output-json
+
+# Output includes: expression, eml_expression, depth, strategy, mse, constants, leaf_types
 ```
 
 ---
@@ -124,7 +136,7 @@ User: "What formula fits this data?"
           |
     Calls eml_symbolic_regression tool
           |
-    Gets back {"expression": "exp(x)", "quality": "exact"}
+    Gets back {"expression": "exp(x)", "quality": "exact", "strategy": "prepass"}
           |
     Reports: "The data follows y = e^x"
 ```
@@ -157,6 +169,16 @@ Three steps:
 ```
 
 The handler calls `from eml import regress` directly and uses `tool_error()` / `tool_result()` from the Hermes registry helpers.
+
+Native Hermes and MCP responses include:
+
+- `expression`: best symbolic form to show the user
+- `quality`: `exact`, `approximate`, or `rough`
+- `strategy`: `prepass` or `eml_tree`
+- `depth`: EML depth only; `0` means the hybrid pre-pass solved it
+- `mse`, `constants`, `eml_expression`
+
+Python and CLI calls also expose `seed` for deterministic search. The current Hermes native / MCP wrappers expose `x`, `y`, and `max_depth`.
 
 #### Option B -- MCP server (no code changes to Hermes)
 
@@ -196,6 +218,8 @@ The tool schema in `hermes/tool_schema.json` is standard OpenAI function-calling
 echo '{"x": [1,2,3,4], "y": [2.72,7.39,20.09,54.60]}' | python -m eml.engine
 ```
 
+On Windows, multiprocessing works best from a normal script or agent process. For ad-hoc REPL / `python -` experiments, prefer the CLI path above or force single-process Python calls with `workers=1`.
+
 ---
 
 ## Benchmarks
@@ -211,7 +235,9 @@ Tested on common functions, 200 data points, `x in [0.1, 4.0]`:
 | `x + 1` | `x + 1` | ~0 | 0 | 0.0s | **EXACT** |
 | `x^2` | `x**2` | ~0 | 0 | 0.0s | **EXACT** |
 | `sqrt(x)` | `sqrt(x)` | ~0 | 0 | 0.1s | **EXACT** |
-| `sin(x)` | approx | 1e-2 | 3 | 29s | Approx |
+| `sin(x)` | approx | 1.9e-2 | 3 | 32.5s | Approx |
+
+`Depth = 0` means the hybrid pre-pass found an exact closed form before any EML tree search ran. It does **not** mean there is a zero-leaf EML tree.
 
 ### Sweet spot
 
@@ -260,17 +286,19 @@ Phase 0  Hybrid exact-form pre-pass
 ```
 Phase 1  Instant eval
          Test all trees with no trainable constants.
+         Uses subtree caching and duplicate filtering for constant-free trees.
          Pure numpy, microseconds each.
          Catches easy wins like eml(x, 1) = exp(x).
 
 Phase 2  Parallel screening
-         Quick-fit constants (1 restart, 200 iterations).
-         ~7ms per tree. Multiprocessing across all CPU cores.
+         Quick-fit constants (1 restart, adaptive iteration budget).
+         Prunes redundant constant-only substructures.
+         Uses stratified sampling plus multiprocessing for large searches.
          Screens thousands of candidates fast.
 
 Phase 3  Full refinement
          Top 30 candidates get full optimisation.
-         3 restarts, 2000 iterations each.
+         3 restarts with broader initialisation scales.
          Polishes the best discoveries.
 ```
 
@@ -282,7 +310,7 @@ EML has **one operator**. The search space is a set of binary trees with uniform
 - Exhaustive search is feasible at depth 1-3
 - The grammar is **provably complete** (not heuristic)
 - Constants are optimised with standard methods (Nelder-Mead)
-- Results are reproducible
+- Results can be made reproducible with `seed=` / `--seed`
 
 ---
 
@@ -292,9 +320,9 @@ EML has **one operator**. The search space is a set of binary trees with uniform
 eml-symbolic-regression/
   eml/
     __init__.py              Clean API: from eml import regress
-    engine.py                Core search engine (3-phase parallel search)
+    engine.py                Hybrid pre-pass + EML search engine
   hermes/
-    hermes_tool.py           Native Hermes tool module (drop into tools/)
+    hermes_tool.py           Native Hermes tool module (returns quality + strategy)
     mcp_server.py            MCP stdio server (configure in config.yaml)
     tool_schema.json         OpenAI function-calling schema (inner format)
     system_prompt_snippet.md System prompt addition for tool guidance
@@ -305,6 +333,8 @@ eml-symbolic-regression/
     from_data_points.py      Realistic scenario (RC circuit decay)
     benchmark.py             Performance table generator
     cli_examples.sh          CLI usage patterns
+  tests/
+    test_engine.py           Regression + symbolic/numeric consistency checks
   pyproject.toml             pip installable
   LICENSE                    MIT
 ```
